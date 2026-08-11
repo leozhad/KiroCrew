@@ -28,16 +28,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 from collections import deque
 from typing import TYPE_CHECKING, Callable, Optional
 
 from kiro_crew.acp.runtime import _get_rss_tree_mb, _iter_descendant_pids
+from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers_system import _get_static_system_info
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.sandbox import SANDBOX_LAUNCHER_PREFIX, SANDBOX_RUN_DIR
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.subagent import _CLK_TCK, _subtree_cpu_jiffies
@@ -75,6 +78,119 @@ def _read_cmdline(pid: int) -> str:
 _RUNTIME_SIGNATURES = ("kirocrew_sandbox", "kiro-cli")
 
 _PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+#: Our Linux sandbox launcher as it appears in a wrapped runtime's argv:
+#: ``<data home>/run/kirocrew_sandbox_<gateway pid>_<rand>.py``. The data home in
+#: that path is what says WHICH Kiro Crew instance owns the process — this
+#: gateway, a pod, or a second install. Built from ``sandbox``'s own constants so
+#: a rename there cannot silently degrade this to "nothing is ever ours".
+_SANDBOX_WRAPPER_RE = re.compile(
+    r"(?P<home>\S+)/"
+    + re.escape(SANDBOX_RUN_DIR)
+    + "/"
+    + re.escape(SANDBOX_LAUNCHER_PREFIX)
+    + r"\d+_[^/\s]+\.py"
+)
+
+#: Any product's launcher of the same shape, ours or not. A FOREIGN launcher is
+#: positive evidence that a runtime is not ours; no launcher at all is no evidence
+#: either way, and the two must not collapse into the same answer.
+_FOREIGN_WRAPPER_RE = re.compile(r"/\w+/(?P<app>[A-Za-z0-9]+)_sandbox_\d+_[^/\s]+\.py")
+
+#: Environment variable naming an instance's data home. Read as a fallback for a
+#: host that runs agents unconfined and therefore has no launcher in the argv.
+_HOME_ENV_PREFIX = "KIROCREW_HOME="
+
+#: Ancestors consulted while looking for launcher evidence. A runtime tree is a
+#: handful of processes deep (launcher -> sandbox -> kiro-cli -> children); the
+#: bound exists so a /proc read racing pid reuse cannot loop.
+_ANCESTOR_SCAN_DEPTH = 12
+
+
+def _ppid(pid: int) -> Optional[int]:
+    """Parent of ``pid``, or None when unreadable.
+
+    Splits on the LAST ``") "`` because a process name can itself contain spaces
+    and parentheses; after that split the parent is field 2 of the remainder.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            fields = fh.read().rsplit(") ", 1)[-1].split()
+        return int(fields[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _env_home(pid: int) -> Optional[str]:
+    """``KIROCREW_HOME`` from a process's environment, or None."""
+    try:
+        with open(f"/proc/{pid}/environ", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    for entry in raw.split("\0"):
+        if entry.startswith(_HOME_ENV_PREFIX):
+            return entry[len(_HOME_ENV_PREFIX) :] or None
+    return None
+
+
+def _runtime_home(pid: int) -> tuple[Optional[str], bool]:
+    """Ownership evidence for ``pid``: ``(our-family data home, evidence found)``.
+
+    Both facts come from ONE ancestor walk, because they answer different
+    questions and a second walker would let one of them rot:
+
+    * A home means our launcher (or ``KIROCREW_HOME``) named it — this gateway, a
+      pod, or a second install; the caller decides which by comparing homes.
+    * ``(None, True)`` means another product's launcher of the same shape is in
+      the tree: positive evidence the runtime is NOT ours.
+    * ``(None, False)`` means nothing claims it. That is not the same as "not
+      ours", and it must not be reported as one: a partial tree-kill can leave
+      the exec'd ``kiro-cli`` reparented to init with its launcher gone, and that
+      is exactly the crashed-gateway case a leak row exists to catch.
+
+    A wrapper's children carry no path of their own, so the whole runtime tree
+    resolves to its root's evidence. ``KIROCREW_HOME`` from the environment is the
+    fallback for a host that runs agents unconfined and so has no launcher — also
+    the only case where that read can succeed, since a sandboxed process is not
+    dumpable. A readable environment that names no home is left unclaimed rather
+    than assumed ours: on the default home the variable is simply absent, and a
+    hand-run ``kiro-cli`` would otherwise be reported as this gateway's leak.
+    """
+    cur: Optional[int] = pid
+    foreign = False
+    for _ in range(_ANCESTOR_SCAN_DEPTH):
+        if cur is None or cur <= 1:
+            break
+        cmd = _read_cmdline(cur)
+        found = _SANDBOX_WRAPPER_RE.search(cmd)
+        if found:
+            return found.group("home"), True
+        if _FOREIGN_WRAPPER_RE.search(cmd):
+            foreign = True
+        cur = _ppid(cur)
+    env = _env_home(pid)
+    if env is not None:
+        return env, True
+    return None, foreign
+
+
+def _real(path: str) -> str:
+    """``path`` with symlinks resolved, so two spellings of one home compare equal
+    (a data home reached via ``/home/<user>`` and via its real mount point)."""
+    try:
+        return os.path.realpath(path)
+    except OSError:  # pragma: no cover — realpath does not touch the disk to fail
+        return path
+
+
+def _our_home() -> Optional[str]:
+    """This gateway's data home, resolved, or None when it cannot be determined."""
+    try:
+        return _real(str(config_dir()))
+    except Exception:  # pragma: no cover — a config hiccup must not fail the page
+        logger.debug("data home resolve failed", exc_info=True)
+        return None
 
 
 def _all_runtime_pids() -> Optional[set[int]]:
@@ -127,23 +243,56 @@ def _process_uptime_s(pid: int) -> Optional[float]:
     return age if age >= 0 else None
 
 
-def _unattributed(owned: set[int], self_pid: int) -> Optional[dict[str, object]]:
-    """Agent runtimes alive on this machine that this gateway does not own.
+def _is_ours(pid: int, our_home: str) -> tuple[bool, bool]:
+    """``(runs out of THIS gateway's data home, ownership could be decided)``.
 
-    The stale-runtime leak: a previous gateway generation's kiro-cli processes
-    keep their memory long after the session that spawned them is gone, and
-    nothing in the owned set can point at them precisely because their owner
-    is what disappeared.
+    The comparison is on resolved paths: one home reached by two spellings (via
+    ``/home/<user>`` and via its real mount point) is one home, and a raw string
+    compare would file every one of our own leaked runtimes as somebody else's.
+    """
+    home, classified = _runtime_home(pid)
+    if home is None:
+        return False, classified
+    return _real(home) == our_home, True
 
-    A pod's runtimes land here too. A pod is a separate gateway with its own
-    data home, so its processes genuinely are not owned by THIS one — hence
-    "not owned by this gateway" rather than "leaked".
+
+def _unowned(owned: set[int], self_pid: int) -> Optional[dict[str, object]]:
+    """Runtimes from THIS gateway's data home that no live session accounts for.
+
+    This is the stale-runtime leak: a previous gateway generation's kiro-cli keeps
+    its memory long after the session that spawned it is gone, and nothing in the
+    owned set can point at it precisely because its owner is what disappeared.
+
+    Everything a launcher attributes elsewhere is deliberately NOT counted.
+    ``kiro-cli`` is the ACP runtime every agent front-end spawns, so the scan also
+    matches other products on the machine, and a pod or a second install is a
+    separate gateway with its own data home. Neither is this gateway's memory, and
+    adding them to this figure is what made it unreadable — a host running one
+    other product read as tens of gigabytes of leak while nothing had leaked.
+
+    ``unclassified`` counts what the scan saw but could attribute to nobody: no
+    launcher anywhere in the tree and no readable ``KIROCREW_HOME``. Those are
+    reported rather than dropped, because dropping them turns the one number that
+    means "you are leaking" into a silent zero in exactly the crashed-gateway case
+    where a launcher dies with its tree.
+
+    Returns None, never a zero record, whenever the question cannot be asked at
+    all: the platform cannot enumerate processes, or our own data home does not
+    resolve. A false all-clear is worse than "cannot look".
     """
     every = _all_runtime_pids()
-    if every is None:
+    our_home = _our_home()
+    if every is None or our_home is None:
         return None
     mine = set(owned) | set(_iter_descendant_pids(self_pid))
-    orphans = sorted(every - mine)
+    orphans: list[int] = []
+    unclassified = 0
+    for pid in sorted(every - mine):
+        ours, classified = _is_ours(pid, our_home)
+        if ours:
+            orphans.append(pid)
+        elif not classified:
+            unclassified += 1
     rss = 0.0
     sampled_any = False
     oldest: Optional[float] = None
@@ -159,6 +308,7 @@ def _unattributed(owned: set[int], self_pid: int) -> Optional[dict[str, object]]
         "procs": len(orphans),
         "rss_mb": round(rss, 1) if sampled_any else None,
         "oldest_uptime_s": round(oldest, 1) if oldest is not None else None,
+        "unclassified": unclassified,
     }
 
 
@@ -330,7 +480,7 @@ class SessionMemorySampler:
 
         return {
             "per_pid": out,
-            "unattributed": _unattributed(owned, os.getpid()),
+            "unowned": _unowned(owned, os.getpid()),
             "spend": slot_spend(),
         }
 
@@ -467,8 +617,11 @@ class SessionMemorySampler:
                 "rss_is_upper_bound": True,
             },
             "history": self.series(),
-            # Agent runtimes this gateway does not own. `null` (not a zero
-            # record) where the platform cannot enumerate processes, so the UI
-            # can tell "none found" apart from "cannot look".
-            "unattributed": samples["unattributed"],
+            # Runtimes from OUR data home that no live session accounts for —
+            # the leak, and nothing else: other instances, pods and other
+            # products on the machine are excluded rather than counted here.
+            # `null` (not a zero record) where the platform cannot enumerate
+            # processes or our own home cannot be resolved, so the UI can tell
+            # "none found" apart from "cannot look".
+            "unowned": samples["unowned"],
         }

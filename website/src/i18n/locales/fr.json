@@ -9758,6 +9758,9 @@
       "group_channel": "Canal",
       "group_none": "Aucun",
       "host_share": "Part de l'hôte",
+      "leaked": "Runtimes perdus",
+      "leaked_gb": "Perdus (Go)",
+      "leaked_hint": "Runtimes d'agent issus du dossier de données de cette passerelle, sans aucune session active derrière eux — de la mémoire que Kiro Crew peut récupérer, souvent laissée par une génération précédente de la passerelle. Un runtime qui vient de démarrer peut apparaître ici le temps d'un rafraîchissement, avant que sa session ne le réclame.",
       "mcp_stubs": "Stubs MCP",
       "mcp_stubs_hint": "Processus stubs MCP : proxys légers reliant cette session aux serveurs d'outils externes (serveurs de langage, navigateurs, bases de données).",
       "memory": "Mémoire",
@@ -9771,8 +9774,7 @@
       "session_task": "Session / Tâche",
       "shared": "en commun",
       "turns": "Tours",
-      "unattributed": "Non attribué",
-      "unattributed_hint": "Runtimes d’agent actifs sur cette machine qui n’appartiennent pas à cette passerelle — un runtime résiduel d’une génération précédente de la passerelle, ou un pod en cours d’exécution (une passerelle distincte avec son propre répertoire de données).",
+      "unclassified": "Runtimes non attribués",
       "uptime": "Durée"
     },
     "settings": {

@@ -9758,6 +9758,9 @@
       "group_channel": "Canale",
       "group_none": "Nessuno",
       "host_share": "Quota host",
+      "leaked": "Runtime dispersi",
+      "leaked_gb": "Dispersi (GB)",
+      "leaked_hint": "Runtime di agente provenienti dalla directory dati di questo gateway, senza alcuna sessione attiva alle spalle: memoria che Kiro Crew può recuperare, di solito lasciata da una generazione precedente del gateway. Un runtime appena avviato può comparire qui per un aggiornamento, prima che la sua sessione lo rivendichi.",
       "mcp_stubs": "Stub MCP",
       "mcp_stubs_hint": "Processi stub MCP: proxy leggeri che collegano questa sessione ai server degli strumenti esterni (server di linguaggio, browser, database).",
       "memory": "Memoria",
@@ -9771,8 +9774,7 @@
       "session_task": "Sessione / Attività",
       "shared": "in comune",
       "turns": "Turni",
-      "unattributed": "Non attribuiti",
-      "unattributed_hint": "Runtime di agente attivi su questa macchina che non appartengono a questo gateway: un runtime residuo di una generazione precedente del gateway, o un pod in esecuzione (un gateway separato con la propria directory dei dati).",
+      "unclassified": "Runtime non attribuiti",
       "uptime": "Tempo attivo"
     },
     "settings": {

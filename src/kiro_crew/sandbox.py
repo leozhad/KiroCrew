@@ -1584,9 +1584,17 @@ if __name__ == "__main__":
 '''
 
 
+#: Filename prefix of the generated sandbox launcher, and the directory under the
+#: data home that holds it: ``<home>/<SANDBOX_RUN_DIR>/<PREFIX><gateway pid>_*``.
+#: ``dashboard.session_memory`` reads a runtime's owning data home back out of
+#: that path, so both sides must name it from here rather than re-spelling it.
+SANDBOX_LAUNCHER_PREFIX = "kirocrew_sandbox_"
+SANDBOX_RUN_DIR = "run"
+
+
 def _ensure_run_dir() -> str:
     """Create ``<config_dir>/run/`` with mode 0o700, falling back to tmpdir on failure."""
-    run_dir = str(config_dir() / "run")
+    run_dir = str(config_dir() / SANDBOX_RUN_DIR)
     try:
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         # exist_ok does not re-apply mode on existing dirs — enforce explicitly.
@@ -1627,7 +1635,7 @@ def namespace_argv(
     )
     run_dir = _ensure_run_dir()
     fd, path = tempfile.mkstemp(
-        suffix=".py", prefix=f"kirocrew_sandbox_{os.getpid()}_", dir=run_dir
+        suffix=".py", prefix=f"{SANDBOX_LAUNCHER_PREFIX}{os.getpid()}_", dir=run_dir
     )
     os.write(fd, script.encode())
     os.close(fd)
@@ -1894,7 +1902,7 @@ def sandbox_exec_argv(
     )
     run_dir = _ensure_run_dir()
     fd, path = tempfile.mkstemp(
-        suffix=".sb", prefix=f"kirocrew_sandbox_{os.getpid()}_", dir=run_dir
+        suffix=".sb", prefix=f"{SANDBOX_LAUNCHER_PREFIX}{os.getpid()}_", dir=run_dir
     )
     os.write(fd, profile.encode())
     os.close(fd)
@@ -1979,7 +1987,7 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
     # ── Sweep <config_dir>/run/ (PID + age) ──
     if os.path.isdir(run_dir):
         for entry in os.listdir(run_dir):
-            if not entry.startswith("kirocrew_sandbox_"):
+            if not entry.startswith(SANDBOX_LAUNCHER_PREFIX):
                 continue
             if entry.endswith(".sb"):
                 suffix = ".sb"
@@ -2001,7 +2009,7 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
                     pass
                 continue
             # Fresh file — fall back to PID liveness check
-            middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
+            middle = entry[len(SANDBOX_LAUNCHER_PREFIX) : -len(suffix)]
             pid_str = middle.split("_", 1)[0]
             if not pid_str.isdigit():
                 continue
@@ -2023,7 +2031,7 @@ def cleanup_stale_sandbox_profiles(*, legacy_dir: str | None = None) -> int:
         try:
             with os.scandir(legacy_dir) as it:
                 for dentry in it:
-                    if not dentry.name.startswith("kirocrew_sandbox_"):
+                    if not dentry.name.startswith(SANDBOX_LAUNCHER_PREFIX):
                         continue
                     if not dentry.name.endswith(".py"):
                         continue

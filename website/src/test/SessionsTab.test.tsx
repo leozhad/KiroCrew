@@ -76,7 +76,7 @@ function defaultPayload() {
       },
     ],
     totals: { rss_mb: 704, runtimes: 2, host_mb: 16384, host_pct: 4.3, rss_is_upper_bound: false },
-    unattributed: { procs: 33, rss_mb: 13824, oldest_uptime_s: 14400 },
+    unowned: { procs: 3, rss_mb: 1024, oldest_uptime_s: 14400, unclassified: 0 },
     history: [{ t: 1, mb: 600 }, { t: 2, mb: 700 }],
   }
 }
@@ -170,12 +170,12 @@ describe('SessionsTab render', () => {
     expect(btn).toBeNull()
   })
 
-  it('shows an empty state when there are no sessions and no unattributed', async () => {
+  it('shows an empty state when there are no sessions and nothing unowned', async () => {
     mockSessionsMemory.mockResolvedValue({
       sessions: [],
       tasks: [],
       totals: { rss_mb: 0, runtimes: 0, host_mb: 16384, host_pct: 0, rss_is_upper_bound: false },
-      unattributed: null,
+      unowned: null,
       history: [],
     })
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
@@ -185,48 +185,96 @@ describe('SessionsTab render', () => {
   })
 })
 
-// ── Unattributed row ──
+// ── Unowned-runtimes row (what THIS gateway leaked) ──
 
-describe('Unattributed row', () => {
-  it('renders above session rows when procs > 0', async () => {
+describe('Unowned runtimes row', () => {
+  it('renders above the session rows when procs > 0', async () => {
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
     await waitFor(() => {
       expect(screen.getByText('Debugging session')).toBeInTheDocument()
     })
-    expect(screen.getByTestId('unattributed-row')).toBeInTheDocument()
+    const row = screen.getByTestId('unowned-row')
+    expect(row).toBeInTheDocument()
+    expect(row.textContent).toContain('3')
   })
 
   it('is hidden when procs is 0', async () => {
     const payload = defaultPayload()
-    payload.unattributed = { procs: 0, rss_mb: 0, oldest_uptime_s: null }
+    payload.unowned = {
+      procs: 0,
+      rss_mb: 0,
+      oldest_uptime_s: null as never,
+      unclassified: 0,
+    }
     mockSessionsMemory.mockResolvedValue(payload)
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
     await waitFor(() => {
       expect(screen.getByText('Debugging session')).toBeInTheDocument()
     })
-    expect(screen.queryByTestId('unattributed-row')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('unowned-row')).not.toBeInTheDocument()
   })
 
-  it('is hidden when unattributed is null (platform cannot enumerate)', async () => {
+  it('is hidden when unowned is null (platform cannot enumerate)', async () => {
     const payload = defaultPayload()
-    payload.unattributed = null as never
+    payload.unowned = null as never
     mockSessionsMemory.mockResolvedValue(payload)
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
     await waitFor(() => {
       expect(screen.getByText('Debugging session')).toBeInTheDocument()
     })
-    expect(screen.queryByTestId('unattributed-row')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('unowned-row')).not.toBeInTheDocument()
   })
 
-  // Finding 6: unattributed uses warn, not danger
-  it('uses text-warn class (not text-danger) for the unattributed row', async () => {
+  it('uses text-warn class (not text-danger)', async () => {
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
     await waitFor(() => {
-      expect(screen.getByTestId('unattributed-row')).toBeInTheDocument()
+      expect(screen.getByTestId('unowned-row')).toBeInTheDocument()
     })
-    const row = screen.getByTestId('unattributed-row')
+    const row = screen.getByTestId('unowned-row')
     expect(row.className).toContain('text-warn')
     expect(row.className).not.toContain('text-danger')
+  })
+
+  it('is the ONLY pinned row: other instances and other apps are not listed', async () => {
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('unowned-row')).toBeInTheDocument()
+    })
+    // The page reports what this gateway occupies, so the leak row is the only
+    // body row that is not one of the payload's sessions. Counting rows is what
+    // makes this real: naming testids that no longer exist could never fail, and
+    // matching on a neighbour's LABEL would miss a row rendered with any other
+    // wording.
+    const sessionTitles = ['Debugging session', 'Daily check', 'Research subtask']
+    const bodyRows = Array.from(document.querySelectorAll('tbody tr'))
+    const pinned = bodyRows.filter(
+      r => !sessionTitles.some(t => (r.textContent ?? '').includes(t)),
+    )
+    expect(pinned).toHaveLength(1)
+    expect(pinned[0]).toBe(screen.getByTestId('unowned-row'))
+  })
+
+  it('counts runtimes it could not attribute, even with zero leaks', async () => {
+    // A leak count of zero that hides unattributable runtimes is a false
+    // all-clear — the failure this row exists to prevent.
+    const payload = defaultPayload()
+    payload.unowned = { procs: 0, rss_mb: 0, oldest_uptime_s: null as never, unclassified: 4 }
+    mockSessionsMemory.mockResolvedValue(payload)
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByText('Debugging session')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('unowned-row')).not.toBeInTheDocument()
+    expect(screen.getByText('Unclassified runtimes')).toBeInTheDocument()
+    expect(screen.getByText('4')).toBeInTheDocument()
+  })
+
+  it('says nothing about unclassified runtimes when there are none', async () => {
+    renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)
+    await waitFor(() => {
+      expect(screen.getByTestId('unowned-row')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Unclassified runtimes')).not.toBeInTheDocument()
   })
 })
 
@@ -412,7 +460,7 @@ describe('Empty state description (finding 7b)', () => {
       sessions: [],
       tasks: [],
       totals: { rss_mb: 0, runtimes: 0, host_mb: 16384, host_pct: 0, rss_is_upper_bound: false },
-      unattributed: null,
+      unowned: null,
       history: [],
     })
     renderWithProviders(<SessionsTab planeStateRef={makePlaneStateRef()} />)

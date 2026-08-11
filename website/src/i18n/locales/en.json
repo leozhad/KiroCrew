@@ -6577,6 +6577,9 @@
       "group_channel": "Channel",
       "group_none": "None",
       "host_share": "Host share",
+      "leaked": "Leaked runtimes",
+      "leaked_gb": "Leaked (GB)",
+      "leaked_hint": "Agent runtimes from this gateway's own data home with no live session behind them — memory Kiro Crew can reclaim, usually left running by a previous gateway generation. A runtime that has just been spawned can appear here for one refresh before its session claims it.",
       "mcp_stubs": "MCP stubs",
       "mcp_stubs_hint": "MCP stub processes: lightweight proxies that bridge this session to external tool servers (language servers, browsers, databases).",
       "memory": "Memory",
@@ -6590,8 +6593,7 @@
       "session_task": "Session / Task",
       "shared": "shared",
       "turns": "Turns",
-      "unattributed": "Unattributed",
-      "unattributed_hint": "Agent runtimes alive on this machine that this gateway does not own — a stale runtime from a previous gateway generation, or a running pod (a separate gateway with its own data home).",
+      "unclassified": "Unclassified runtimes",
       "uptime": "Uptime"
     },
     "settings": {

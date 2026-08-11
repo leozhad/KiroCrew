@@ -9520,6 +9520,9 @@
       "group_channel": "渠道",
       "group_none": "不分组",
       "host_share": "主机占比",
+      "leaked": "泄漏的运行时",
+      "leaked_gb": "泄漏（GB）",
+      "leaked_hint": "属于本网关数据目录、但背后已没有活跃会话的智能体运行时 —— 这部分内存 Kiro Crew 可以回收，通常是上一代网关遗留下来的。刚启动的运行时可能会在这里出现一次刷新，随后即被其会话认领。",
       "mcp_stubs": "MCP 桩",
       "mcp_stubs_hint": "MCP 桩进程：将此会话连接到外部工具服务器（语言服务器、浏览器、数据库）的轻量代理。",
       "memory": "记忆",
@@ -9533,8 +9536,7 @@
       "session_task": "会话 / 任务",
       "shared": "共用",
       "turns": "轮次",
-      "unattributed": "无归属",
-      "unattributed_hint": "本机上存活、但不归此网关所有的 agent 运行时——可能是上一代网关残留下来，也可能是一个正在运行的 pod（独立网关，有自己数据目录）。",
+      "unclassified": "无法归属的运行时",
       "uptime": "运行时长"
     },
     "settings": {

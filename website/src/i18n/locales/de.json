@@ -9639,6 +9639,9 @@
       "group_channel": "Kanal",
       "group_none": "Keine",
       "host_share": "Host-Anteil",
+      "leaked": "Verlorene Laufzeiten",
+      "leaked_gb": "Verloren (GB)",
+      "leaked_hint": "Agent-Laufzeiten aus dem Datenverzeichnis dieses Gateways, hinter denen keine aktive Sitzung mehr steht — Speicher, den Kiro Crew zurückholen kann, meist von einer früheren Gateway-Generation zurückgelassen. Eine gerade gestartete Laufzeit kann hier für eine Aktualisierung erscheinen, bevor ihre Sitzung sie übernimmt.",
       "mcp_stubs": "MCP-Stubs",
       "mcp_stubs_hint": "MCP-Stub-Prozesse: leichtgewichtige Proxys, die diese Sitzung mit externen Tool-Servern verbinden (Sprachserver, Browser, Datenbanken).",
       "memory": "Erinnerung",
@@ -9652,8 +9655,7 @@
       "session_task": "Sitzung / Aufgabe",
       "shared": "geteilt",
       "turns": "Züge",
-      "unattributed": "Nicht zugeordnet",
-      "unattributed_hint": "Auf diesem Rechner laufende Agent-Runtimes, die diesem Gateway nicht gehören — eine übrig gebliebene Runtime einer früheren Gateway-Generation oder ein laufender Pod (ein eigenes Gateway mit eigenem Datenverzeichnis).",
+      "unclassified": "Nicht zuordenbare Laufzeiten",
       "uptime": "Laufzeit"
     },
     "settings": {

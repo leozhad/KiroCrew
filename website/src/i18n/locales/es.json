@@ -9758,6 +9758,9 @@
       "group_channel": "Canal",
       "group_none": "Ninguno",
       "host_share": "Cuota del host",
+      "leaked": "Runtimes filtrados",
+      "leaked_gb": "Filtrados (GB)",
+      "leaked_hint": "Runtimes de agente del directorio de datos de esta pasarela que ya no tienen ninguna sesión activa detrás: memoria que Kiro Crew puede recuperar, normalmente dejada por una generación anterior de la pasarela. Un runtime recién iniciado puede aparecer aquí durante una actualización, antes de que su sesión lo reclame.",
       "mcp_stubs": "Stubs MCP",
       "mcp_stubs_hint": "Procesos stub MCP: proxies ligeros que conectan esta sesión con servidores de herramientas externos (servidores de lenguaje, navegadores, bases de datos).",
       "memory": "Memoria",
@@ -9771,8 +9774,7 @@
       "session_task": "Sesión / Tarea",
       "shared": "en común",
       "turns": "Turnos",
-      "unattributed": "Sin atribuir",
-      "unattributed_hint": "Runtimes de agente activos en esta máquina que no pertenecen a esta pasarela: un runtime residual de una generación anterior de la pasarela, o un pod en ejecución (una pasarela aparte con su propio directorio de datos).",
+      "unclassified": "Runtimes sin clasificar",
       "uptime": "Tiempo activo"
     },
     "settings": {

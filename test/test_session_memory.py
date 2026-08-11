@@ -12,6 +12,13 @@ import pytest
 
 from kiro_crew.dashboard import session_memory as sm
 
+#: Data homes for the ownership fixtures, RESOLVED the same way production
+#: resolves them. A bare POSIX literal compared against a resolved runtime home
+#: differs on Windows, so every assertion here would fail for the wrong reason.
+_OURS = sm._real("/data/.kirocrew")
+_OTHER = sm._real("/data/.kirocrew-juno")
+_POD = sm._real("/data/.kirocrew-pods/a")
+
 
 class _FakeSlot:
     def __init__(self, title: str) -> None:
@@ -444,7 +451,7 @@ def test_runtime_pids_skips_dead_manager_runtimes() -> None:
     assert "Background runtime" not in keys
 
 
-# ── orphan detection (_all_runtime_pids / _unattributed) ───────────────────
+# ── leak detection (_all_runtime_pids / _unowned) ──────────────────────────
 
 
 def test_all_runtime_pids_returns_none_on_non_linux(
@@ -469,16 +476,26 @@ def test_all_runtime_pids_finds_matching_cmdlines(
     assert sm._all_runtime_pids() == {1, 2}
 
 
-def test_unattributed_returns_none_when_platform_cannot_enumerate(
+def test_unowned_returns_none_when_platform_cannot_enumerate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """null in the payload, NOT a zero record."""
     monkeypatch.setattr(sm, "_all_runtime_pids", lambda: None)
-    result = sm._unattributed(set(), 999)
+    result = sm._unowned(set(), 999)
     assert result is None
 
 
-def test_unattributed_excludes_owned_and_gateway_tree(
+def test_unowned_returns_none_when_our_home_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without our own home there is nothing to compare against, and reporting
+    zero leaks would be a false all-clear."""
+    monkeypatch.setattr(sm, "_all_runtime_pids", lambda: {10})
+    monkeypatch.setattr(sm, "_our_home", lambda: None)
+    assert sm._unowned(set(), 1) is None
+
+
+def test_unowned_excludes_owned_and_gateway_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Owned pids + the gateway's own tree must be subtracted from every runtime."""
@@ -490,11 +507,13 @@ def test_unattributed_excludes_owned_and_gateway_tree(
     monkeypatch.setattr(
         sm, "_iter_descendant_pids", lambda pid: [99, 100, 101, 30] if pid == 99 else []
     )
+    monkeypatch.setattr(sm, "_our_home", lambda: _OURS)
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (_OURS, True))
     monkeypatch.setattr(sm, "_rss_mb_for_pid", lambda pid: 512.0)
     monkeypatch.setattr(sm, "_process_uptime_s", lambda pid: 3600.0)
-    result = sm._unattributed(owned, 99)
+    result = sm._unowned(owned, 99)
     assert result is not None
-    # Only pid 40 is unattributed (10,20 owned; 30 in gateway tree)
+    # Only pid 40 is unowned (10,20 owned; 30 in gateway tree)
     assert result["procs"] == 1
     assert result["rss_mb"] == 512.0
     assert result["oldest_uptime_s"] == 3600.0
@@ -512,15 +531,17 @@ def test_rss_mb_for_pid_returns_none_on_unreadable_pid(
     assert sm._rss_mb_for_pid(99999) is None
 
 
-def test_unattributed_rss_is_none_when_every_pid_unreadable(
+def test_unowned_rss_is_none_when_every_pid_unreadable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """procs counts the pids even when RSS is unreadable for all of them."""
     monkeypatch.setattr(sm, "_all_runtime_pids", lambda: {50, 51})
     monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid: [])
+    monkeypatch.setattr(sm, "_our_home", lambda: _OURS)
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (_OURS, True))
     monkeypatch.setattr(sm, "_rss_mb_for_pid", lambda pid: None)
     monkeypatch.setattr(sm, "_process_uptime_s", lambda pid: None)
-    result = sm._unattributed(set(), 1)
+    result = sm._unowned(set(), 1)
     assert result is not None
     assert result["procs"] == 2
     assert result["rss_mb"] is None
@@ -530,12 +551,279 @@ def test_oldest_uptime_reports_maximum_age(monkeypatch: pytest.MonkeyPatch) -> N
     """The MAXIMUM age across the orphan set, not first or last."""
     monkeypatch.setattr(sm, "_all_runtime_pids", lambda: {60, 61, 62})
     monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid: [])
+    monkeypatch.setattr(sm, "_our_home", lambda: _OURS)
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (_OURS, True))
     monkeypatch.setattr(sm, "_rss_mb_for_pid", lambda pid: 100.0)
     ages = {60: 100.0, 61: 9999.0, 62: 500.0}
     monkeypatch.setattr(sm, "_process_uptime_s", lambda pid: ages.get(pid))
-    result = sm._unattributed(set(), 1)
+    result = sm._unowned(set(), 1)
     assert result is not None
     assert result["oldest_uptime_s"] == 9999.0
+
+
+# ── ownership (which data home a matched runtime belongs to) ──────────────
+
+
+def _wrapper(home: str, gateway_pid: int = 4242) -> str:
+    """A wrapped runtime's argv, exactly as the Linux launcher spells it."""
+    return (
+        f"/opt/app/.venv/bin/python {home}/run/kirocrew_sandbox_{gateway_pid}_ab3x9q.py "
+        f"/usr/bin/kiro-cli acp --agent kirocrew"
+    )
+
+
+def test_ppid_survives_a_process_name_containing_spaces_and_parens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+) -> None:
+    """The comm field is untrusted text; splitting on the FIRST ')' loses the ppid."""
+    from pathlib import Path
+
+    stat = Path(str(tmp_path)) / "stat"
+    stat.write_text("77 (kiro) cli) S 1234 77 77 0 -1 4194304 0")
+
+    monkeypatch.setattr(
+        "builtins.open", lambda path, *a, **k: stat.open(encoding="utf-8")
+    )
+    assert sm._ppid(77) == 1234
+
+
+def test_ppid_is_none_when_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(*_a: object, **_k: object) -> None:
+        raise OSError("gone")
+
+    monkeypatch.setattr("builtins.open", _raise)
+    assert sm._ppid(1) is None
+
+
+def test_runtime_home_reads_the_launcher_path_off_the_process_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: _wrapper("/data/.kirocrew"))
+    monkeypatch.setattr(sm, "_ppid", lambda pid: None)
+    assert sm._runtime_home(10) == ("/data/.kirocrew", True)
+
+
+def test_runtime_home_inherits_from_the_nearest_wrapped_ancestor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wrapper's children carry no path of their own, so the whole tree resolves
+    to its root's home instead of reading as a foreign product."""
+    cmdlines = {
+        11: "/usr/bin/kiro-cli acp --agent kirocrew",  # child: bare
+        10: _wrapper("/data/.kirocrew-pods/wt-x"),  # launcher root
+    }
+    parents = {11: 10, 10: 1}
+    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: cmdlines.get(pid, ""))
+    monkeypatch.setattr(sm, "_ppid", lambda pid: parents.get(pid))
+    assert sm._runtime_home(11) == ("/data/.kirocrew-pods/wt-x", True)
+
+
+def test_runtime_home_falls_back_to_the_environment_without_a_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfined host has no launcher, and is the only host whose environ is
+    readable — a sandboxed process is not dumpable."""
+    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: "/usr/bin/kiro-cli acp")
+    monkeypatch.setattr(sm, "_ppid", lambda pid: 1)
+    monkeypatch.setattr(sm, "_env_home", lambda pid: "/data/.kirocrew")
+    assert sm._runtime_home(12) == ("/data/.kirocrew", True)
+
+
+def test_runtime_home_stops_walking_a_parent_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pid reuse between the two /proc reads can present a cycle; the walk is bounded."""
+    reads: list[int] = []
+
+    def _cmd(pid: int) -> str:
+        reads.append(pid)
+        return "/usr/bin/kiro-cli acp"
+
+    monkeypatch.setattr(sm, "_read_cmdline", _cmd)
+    monkeypatch.setattr(sm, "_ppid", lambda pid: 20 if pid == 21 else 21)
+    monkeypatch.setattr(sm, "_env_home", lambda pid: None)
+    assert sm._runtime_home(20) == (None, False)
+    # Terminates, and visits ancestors rather than only the process itself.
+    assert 1 < len(reads) <= 16
+
+
+def test_env_home_reads_the_variable_and_ignores_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+) -> None:
+    from pathlib import Path
+
+    environ = Path(str(tmp_path)) / "environ"
+    environ.write_text("PATH=/bin\0KIROCREW_HOME=/data/.kirocrew\0TERM=xterm\0")
+    monkeypatch.setattr(
+        "builtins.open", lambda path, *a, **k: environ.open(encoding="utf-8")
+    )
+    assert sm._env_home(5) == "/data/.kirocrew"
+
+
+def test_env_home_is_none_when_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandboxed process denies the read; that is not evidence of ownership."""
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise OSError("permission denied")
+
+    monkeypatch.setattr("builtins.open", _raise)
+    assert sm._env_home(5) is None
+
+
+def test_ownership_fixtures_are_resolved_paths() -> None:
+    """Ratchet: the home fixtures must equal their own resolution.
+
+    `_is_ours` compares resolved paths, so a bare literal fixture matches on
+    POSIX by luck and mismatches on Windows (drive letter + separators), failing
+    every ownership assertion for a reason that has nothing to do with the code.
+    """
+    for home in (_OURS, _OTHER, _POD):
+        assert sm._real(home) == home
+
+
+def test_a_foreign_launcher_is_positive_evidence_not_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another product's launcher of the same shape decides the question: the
+    runtime is not ours. Reading it as "no evidence" would put every neighbour
+    into the unclassified count and make that number meaningless."""
+    cmdlines = {
+        21: "/usr/bin/kiro-cli acp --agent other",
+        20: "/opt/other/.venv/bin/python /home/u/.other/run/other_sandbox_9_ab.py kiro-cli",
+    }
+    parents = {21: 20, 20: 1}
+    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: cmdlines.get(pid, ""))
+    monkeypatch.setattr(sm, "_ppid", lambda pid: parents.get(pid))
+    monkeypatch.setattr(sm, "_env_home", lambda pid: None)
+    assert sm._runtime_home(21) == (None, True)
+
+
+def test_a_runtime_with_no_launcher_at_all_is_unclassified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial tree-kill can leave the exec'd kiro-cli reparented to init with
+    its launcher gone. Nothing claims it, and calling that "not ours" would hide a
+    real leak in exactly the crashed-gateway case this row exists to catch."""
+    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: "/usr/bin/kiro-cli acp")
+    monkeypatch.setattr(sm, "_ppid", lambda pid: 1)
+    monkeypatch.setattr(sm, "_env_home", lambda pid: None)
+    assert sm._runtime_home(30) == (None, False)
+
+
+def test_unowned_counts_unclassified_runtimes_instead_of_dropping_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The leak figure must not read as a definitive zero while runtimes the scan
+    could not attribute are alive."""
+    monkeypatch.setattr(sm, "_all_runtime_pids", lambda: {40, 41, 42})
+    monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid: [])
+    monkeypatch.setattr(sm, "_our_home", lambda: _OURS)
+    evidence = {
+        40: (_OTHER, True),  # a neighbour: decided, excluded
+        41: (None, True),  # another product's launcher: decided, excluded
+        42: (None, False),  # nothing claims it: unclassified
+    }
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: evidence[pid])
+    monkeypatch.setattr(sm, "_rss_mb_for_pid", lambda pid: 100.0)
+    monkeypatch.setattr(sm, "_process_uptime_s", lambda pid: 10.0)
+
+    result = sm._unowned(set(), 1)
+    assert result is not None
+    assert result["procs"] == 0
+    assert result["unclassified"] == 1
+
+
+def test_the_launcher_pattern_tracks_the_sandbox_module(tmp_path: object) -> None:
+    """Ratchet: the ownership regex is built from `sandbox`'s own constants, so a
+    rename there cannot degrade detection to "nothing is ever ours" while every
+    test stays green."""
+    from kiro_crew.sandbox import SANDBOX_LAUNCHER_PREFIX, SANDBOX_RUN_DIR
+
+    home = "/data/.kirocrew"
+    argv = (
+        f"/opt/app/.venv/bin/python "
+        f"{home}/{SANDBOX_RUN_DIR}/{SANDBOX_LAUNCHER_PREFIX}4242_ab3x9q.py "
+        f"/usr/bin/kiro-cli acp --agent kirocrew"
+    )
+    found = sm._SANDBOX_WRAPPER_RE.search(argv)
+    assert found is not None, "the regex no longer matches what sandbox.py builds"
+    assert found.group("home") == home
+
+
+def test_is_ours_accepts_a_runtime_from_our_own_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (_OURS, True))
+    assert sm._is_ours(1, _OURS) == (True, True)
+
+
+def test_is_ours_rejects_another_instance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pod or a second install is a separate gateway with its own data home; its
+    memory is not this gateway's and must not land in the leak count."""
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (_OTHER, True))
+    # Classified: a launcher named a home, it just is not ours.
+    assert sm._is_ours(1, _OURS) == (False, True)
+
+
+def test_is_ours_rejects_a_runtime_with_no_kirocrew_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`kiro-cli` is the ACP runtime every agent front-end spawns, so a match with
+    no Kiro Crew data home behind it belongs to a different product."""
+    monkeypatch.setattr(sm, "_runtime_home", lambda pid: (None, True))
+    assert sm._is_ours(1, _OURS) == (False, True)
+
+
+def test_is_ours_compares_homes_through_symlinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object,
+) -> None:
+    """One home reached by two spellings is one home; a raw string compare would
+    drop every one of our own leaked runtimes as somebody else's."""
+    from pathlib import Path
+
+    root = Path(str(tmp_path))
+    real = root / "real" / ".kirocrew"
+    real.mkdir(parents=True)
+    link = root / "home"
+    link.symlink_to(root / "real")
+
+    monkeypatch.setattr(
+        sm, "_runtime_home", lambda pid: (str(link / ".kirocrew"), True)
+    )
+    assert sm._is_ours(1, str(real)) == (True, True)
+
+
+def test_unowned_counts_only_runtimes_from_our_own_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pods, other installs and other products are EXCLUDED, not bucketed: the
+    page reports what this gateway occupies, and a machine full of neighbours
+    used to read as a multi-GB leak."""
+    monkeypatch.setattr(sm, "_all_runtime_pids", lambda: {10, 11, 12, 13, 14})
+    monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid: [])
+    monkeypatch.setattr(sm, "_our_home", lambda: _OURS)
+    homes = {
+        10: _OURS,  # leaked: ours, no live session
+        11: _POD,  # a pod
+        12: _OTHER,  # a second install
+        13: _OURS,  # leaked as well
+        14: None,  # another product on the machine
+    }
+    monkeypatch.setattr(
+        sm, "_runtime_home", lambda pid: (homes[pid], homes[pid] is not None)
+    )
+    monkeypatch.setattr(sm, "_rss_mb_for_pid", lambda pid: 100.0)
+    ages = {10: 60.0, 11: 90000.0, 12: 80000.0, 13: 70.0, 14: 50000.0}
+    monkeypatch.setattr(sm, "_process_uptime_s", lambda pid: ages[pid])
+
+    result = sm._unowned(set(), 1)
+    assert result is not None
+    assert result["procs"] == 2
+    assert result["rss_mb"] == 200.0
+    # The oldest process on the machine belongs to a NEIGHBOUR; lending its age
+    # to this row is the same misreport in a different column.
+    assert result["oldest_uptime_s"] == 70.0
+    assert "groups" not in result
 
 
 # ── credits / turns (slot_spend — unified aggregator in usage.py) ──────────
