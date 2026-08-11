@@ -54,6 +54,7 @@ from kiro_crew.autonudge import (
     is_channel_key,
     runtime_budget_exceeded,
 )
+from kiro_crew.beacon import distribution
 from kiro_crew.channel_history import ChannelHistory
 from kiro_crew.channels import builtin_channel_descriptors
 from kiro_crew.config import KiroCrewConfig
@@ -96,6 +97,7 @@ from kiro_crew.dashboard.cron_inject import (
 from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 from kiro_crew.dashboard.handlers.autonudge import render_nudge_message
 from kiro_crew.dashboard.handlers.messaging import _rehydrate_slot_from_history
+from kiro_crew.dashboard.handlers.updates import remediation_command as _remediation_command
 from kiro_crew.dashboard.handlers.usage import (
     persist_token_record_async,
     read_context_tokens,
@@ -184,6 +186,11 @@ from kiro_crew.platform.governance_profiles import (
     HOST_SESSION_KEY,
     audit_governance_degraded,
     governance_permits,
+)
+from kiro_crew.platform.update_capability import (
+    CHECK_SUCCEEDED,
+    CHECK_UNCHECKED,
+    EXTERNALLY_MANAGED_STAMPS,
 )
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import safety_override
@@ -5903,6 +5910,10 @@ class GatewayOrchestrator:
             from kiro_crew.dashboard.handlers import _do_update_check, _update_info
 
             await _do_update_check()
+            # Snapshot: the branches below read several keys with awaits
+            # between them, and a dashboard-triggered check running
+            # concurrently replaces the cache wholesale.
+            info = dict(_update_info)
             from kiro_crew.platform.update_governance import min_version, update_required
 
             # A policy-pinned minimum version makes the update MANDATORY: it
@@ -5916,24 +5927,24 @@ class GatewayOrchestrator:
             # still applies the source pin and its own no-new-commits early
             # return, so this cannot bypass the ceiling or loop.
             #
-            # Not gated on `self_updatable`: a policy floor is an enterprise
+            # Not gated on `can_apply`: a policy floor is an enterprise
             # ceiling, and this branch has always attempted the git apply on every
             # layout. Teaching it the wheel path (which needs the installer, not a
             # git reset) is a separate change from making the CHECK honest.
             if update_required(_running_version):
                 # A mandatory floor is handled by layout, because "apply" means
                 # different things per install shape:
-                #   * git checkout (self_updatable) -> git fetch + reset applies.
-                #   * wheel/cli.sh (not self_updatable, but carries an installer
-                #     `update_command`) -> cannot self-apply unattended; warn and
-                #     light the dashboard badge so the operator runs `kirocrew
-                #     update`. Before this branch existed the path `return`ed
-                #     silently, leaving the host below the floor with no signal.
-                #   * externally managed (dmg/appimage/docker: not self_updatable
-                #     AND no `update_command`) -> its own updater owns this; the
-                #     backend must not drive a git reset on a non-git tree nor
-                #     show an inapplicable CLI-update badge. Log and return.
-                if _update_info.get("self_updatable"):
+                #   * git checkout (`can_apply`) -> git fetch + reset applies.
+                #   * wheel/cli.sh (no `can_apply`, but carries an installer
+                #     command in `remediation`) -> cannot self-apply unattended;
+                #     warn and light the dashboard badge so the operator runs
+                #     `kirocrew update`.
+                #   * externally managed (dmg/appimage/docker: no `can_apply` and
+                #     no command) -> its own updater owns this; the backend must
+                #     not drive a git reset on a non-git tree. It still gets the
+                #     badge, because a non-compliant install with no signal at
+                #     all is the worse failure.
+                if info.get("can_apply"):
                     logger.warning(
                         "Version compliance: running %s is below the policy minimum %s — "
                         "applying a mandatory update (overrides auto_update)",
@@ -5942,33 +5953,59 @@ class GatewayOrchestrator:
                     )
                     await self._auto_apply_update()
                     return
-                if _update_info.get("update_command"):
+                # Everything below cannot self-apply, so the operator has to act.
+                # Two of the three cases light the badge; the third deliberately
+                # does not, because a dmg/appimage/docker install cannot act on a
+                # CLI-update badge and its own updater owns the upgrade.
+                #
+                # Where the badge IS lit, `check_status` and `error_code` are left
+                # exactly as the check left them. Stamping them "succeeded" would
+                # erase the only evidence that the check path itself is broken,
+                # which is worse than a payload carrying two independent facts: an
+                # update is mandated (a LOCAL determination against the policy pin,
+                # which does not need the feed) and the feed check did not complete.
+                if _remediation_command(info):
                     logger.warning(
                         "Version compliance: running %s is below the policy minimum %s, "
                         "but this install (%s) updates by re-running the installer — "
                         "run `kirocrew update`",
                         _running_version,
                         min_version(),
-                        _update_info.get("install_kind") or "unknown",
+                        info.get("managed_by") or "unknown",
                     )
-                    # Light the badge: the SSE snapshot reads
-                    # `_update_info["available"]`, which the check may have left
-                    # False (a pre-release remote reads as not-newer) even though
-                    # the floor makes this update mandatory.
-                    _update_info["available"] = True
+                    _badge = True
+                elif info.get("check_status") in ("unchecked", "checking"):
+                    # The check no-ops while another one is in flight, so the cache
+                    # can hold no verdict here — and with no verdict there is no
+                    # `managed_by` either. The baked distribution stamp answers the
+                    # one question the badge needs and costs no I/O, so an
+                    # externally managed install is not handed a CLI-update badge it
+                    # cannot act on.
+                    logger.warning(
+                        "Version compliance: running %s is below the policy minimum %s, but no "
+                        "check has reached a verdict yet — the next cycle decides which surface "
+                        "owns the upgrade",
+                        _running_version,
+                        min_version(),
+                    )
+                    _badge = distribution() not in EXTERNALLY_MANAGED_STAMPS
+                else:
+                    logger.warning(
+                        "Version compliance: running %s is below the policy minimum %s, but "
+                        "this install (%s) is updated by its own updater — not applying from "
+                        "the backend",
+                        _running_version,
+                        min_version(),
+                        info.get("managed_by") or "unknown",
+                    )
+                    _badge = False
+                if _badge:
+                    _update_info["update_available"] = True
                     if self.dashboard_state:
                         self.dashboard_state.push_refresh("update_available")
-                    return
-                logger.warning(
-                    "Version compliance: running %s is below the policy minimum %s, but this "
-                    "install (%s) is updated by its own updater — not applying from the backend",
-                    _running_version,
-                    min_version(),
-                    _update_info.get("install_kind") or "unknown",
-                )
                 return
 
-            if _update_info.get("available"):
+            if info.get("update_available"):
                 logger.info("Updates available from remote")
                 from kiro_crew.config import KiroCrewConfig
 
@@ -5979,7 +6016,7 @@ class GatewayOrchestrator:
                 # unattended — so notify instead. Without this guard, the wheel
                 # path in `_do_update_check` (which can now report `available`)
                 # would drive a git reset in a tree that has no `.git`.
-                if cfg.auto_update and _update_info.get("self_updatable"):
+                if cfg.auto_update and info.get("can_apply"):
                     logger.info("Auto-update enabled — applying update")
                     await self._auto_apply_update()
                 else:
@@ -5987,17 +6024,28 @@ class GatewayOrchestrator:
                         logger.warning(
                             "Auto-update is on, but this install (%s) updates by "
                             "re-running the installer, not by git — notifying instead",
-                            _update_info.get("install_kind") or "unknown",
+                            info.get("managed_by") or "unknown",
                         )
                     if self.dashboard_state:
                         self.dashboard_state.push_refresh("update_available")
-            elif _update_info.get("error"):
+            elif info.get("error_code"):
                 # A check that could not run is NOT "already on latest" — saying so
-                # is the exact false reassurance the honest-`checked` contract in
+                # is the exact false reassurance the honesty pair in
                 # `handlers/updates.py` exists to prevent.
-                logger.info("Update check did not complete (%s)", _update_info.get("error"))
-            else:
+                logger.info(
+                    "Update check did not complete (%s)", info.get("error_code")
+                )
+            elif info.get("check_status") == CHECK_SUCCEEDED:
                 print("👻 Already on latest version")
+            else:
+                # DEFERRED (a desktop bundle whose own updater owns this), or a
+                # check that never ran. Neither carries an `error_code`, so keying
+                # only on that would fall through to the reassurance above and
+                # claim a verdict nothing produced.
+                logger.info(
+                    "No update verdict to report (check_status=%s)",
+                    info.get("check_status") or CHECK_UNCHECKED,
+                )
         except Exception:
             logger.debug("Update check failed", exc_info=True)
 

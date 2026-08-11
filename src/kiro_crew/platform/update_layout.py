@@ -12,15 +12,23 @@ from typing import NamedTuple
 
 from kiro_crew.beacon import distribution
 from kiro_crew.config.paths import data_home
+from kiro_crew.platform.update_capability import (
+    EXTERNALLY_MANAGED_MESSAGES,
+    UNAVAILABLE_MANAGED_BY_APP,
+    UNAVAILABLE_MANAGED_BY_IMAGE,
+    is_git_worktree,
+)
 
 #: Release channels the installer publishes.
 RELEASE_CHANNELS = ("stable", "insider", "nightly")
 
-#: Distributions managed by an external updater (desktop app, container).
+#: Distributions managed by an external updater (desktop app, container), mapped
+#: to the copy shown for them. Built from the capability module's table so the
+#: CLI and the dashboard cannot show different words for the same state.
 EXTERNALLY_MANAGED = {
-    "dmg": "Update via the desktop app's built-in updater (About → Check for updates).",
-    "appimage": "Update via the desktop app's built-in updater (About → Check for updates).",
-    "docker": "Update by pulling a newer image (docker pull).",
+    "dmg": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_APP],
+    "appimage": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_APP],
+    "docker": EXTERNALLY_MANAGED_MESSAGES[UNAVAILABLE_MANAGED_BY_IMAGE],
 }
 
 
@@ -40,7 +48,7 @@ def detect_install_layout() -> InstallLayout:
     Returns an InstallLayout describing how to update this instance.
     """
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    is_git = bool(proj) and os.path.exists(os.path.join(proj, ".git"))
+    is_git = is_git_worktree(proj)
 
     if is_git:
         return InstallLayout(

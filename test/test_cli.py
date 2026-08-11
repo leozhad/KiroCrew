@@ -349,14 +349,14 @@ class TestSetupWorkspaceDir:
         assert "Default:" in output
 
 
-# Common patches for _update tests — simulate a source tree with a git pull that has changes
-_UPDATE_PATCHES = {
-    "KIROCREW_PROJECT_DIR": "/fake/proj",
-}
+# The _update tests simulate a source tree whose git calls are faked. The project
+# root has to be a REAL directory, because update detection resolves git's answer
+# to one — so each test takes it from its own tmp_path rather than a module-level
+# temp dir, which would be created at collection time and outlive the run.
 
 
 def _patch_path():
-    """Mock Path so .git check passes, .install-method is absent, and .brazil dir exists."""
+    """Mock Path so .install-method is absent and the .brazil dir exists."""
     mock_git_dir = MagicMock(
         is_dir=MagicMock(return_value=True), exists=MagicMock(return_value=True)
     )
@@ -386,15 +386,18 @@ class TestUpdateFailures:
     A non-zero return code from a critical step exits with code 1.
     """
 
-    @patch.dict("os.environ", _UPDATE_PATCHES)
-    def test_git_fetch_failure_exits(self):
+    def test_git_fetch_failure_exits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+
         def _side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             m = MagicMock()
             m.returncode = 0
             m.stdout = ""
             m.stderr = ""
-            if cmd and "rev-parse" in cmd:
+            if cmd and "--show-toplevel" in cmd:
+                m.stdout = str(tmp_path)
+            elif cmd and "rev-parse" in cmd:
                 m.stdout = "beta-braveheart"
             if cmd and "fetch" in cmd:
                 m.returncode = 1
@@ -408,15 +411,18 @@ class TestUpdateFailures:
             except SystemExit as e:
                 assert e.code == 1
 
-    @patch.dict("os.environ", _UPDATE_PATCHES)
-    def test_pip_install_failure_exits(self):
+    def test_pip_install_failure_exits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+
         def _side_effect(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             m = MagicMock()
             m.returncode = 0
             m.stdout = ""
             m.stderr = ""
-            if cmd and "rev-parse" in cmd:
+            if cmd and "--show-toplevel" in cmd:
+                m.stdout = str(tmp_path)
+            elif cmd and "rev-parse" in cmd:
                 m.stdout = "beta-braveheart"
             # git diff --quiet returns 1 when there ARE new commits
             if cmd and "diff" in cmd and "--quiet" in cmd:

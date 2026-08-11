@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew import __version__, platform_compat
-from kiro_crew.beacon import is_default_home
+from kiro_crew.beacon import distribution, is_default_home
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     _DEFAULT_PORT,
@@ -50,6 +50,11 @@ from kiro_crew.instances import run_marker
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
+from kiro_crew.platform.update_capability import (
+    EXTERNALLY_MANAGED_MESSAGES,
+    MANAGED_BY_GIT,
+    derive_capability,
+)
 from kiro_crew.preflight import run_preflight_checks
 from kiro_crew.sel import sel
 from kiro_crew.service import controller as service_controller
@@ -1175,30 +1180,29 @@ def _update() -> None:
     * **externally managed** (desktop app, Docker) — print guidance on how
       to update via the correct surface instead of failing with an opaque error.
     """
-    from kiro_crew.platform.update_layout import (
-        EXTERNALLY_MANAGED,
-        InstallLayout,
-    )
+    from kiro_crew.platform.update_layout import InstallLayout
 
     print("👻 Updating Kiro Crew…\n")
 
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    proj_path = Path(proj) if proj else None
-    is_git = proj_path is not None and (proj_path / ".git").exists()
+    # Dispatch on the shared derivation, not on the git probe alone. The probe
+    # answers "is this a working tree", which is NOT the same question as "who
+    # owns updating this install": a container or a desktop bundle pointed at a
+    # checkout would otherwise take the git path here and reset a tree its own
+    # updater owns. `derive_capability` puts the externally managed stamp first
+    # for exactly that reason, and this is the surface that has to honour it.
+    capability = derive_capability(install_root=proj)
 
-    if not is_git:
-        # Not a git checkout — check if externally managed or wheel install.
-        from kiro_crew.beacon import distribution
-
-        dist = distribution()
-        if dist in EXTERNALLY_MANAGED:
-            print(f"  ℹ️  This install ({dist}) is managed externally.")
-            print(f"  {EXTERNALLY_MANAGED[dist]}")
+    if capability.managed_by != MANAGED_BY_GIT:
+        if capability.defers:
+            reason = capability.unavailable_reason or ""
+            print(f"  ℹ️  This install ({distribution()}) is managed externally.")
+            print(f"  {EXTERNALLY_MANAGED_MESSAGES.get(reason, '')}")
             return
 
         # Wheel / cli.sh install path.
         layout = InstallLayout(
-            kind=dist or "wheel",
+            kind=distribution() or "wheel",
             proj=proj,
             is_git=False,
             is_externally_managed=False,
@@ -1206,14 +1210,6 @@ def _update() -> None:
         )
         _update_wheel(layout)
         return
-
-    # A git worktree or submodule stores ``.git`` as a FILE (a ``gitdir:``
-    # pointer), not a directory, so accept both — otherwise `kirocrew update`
-    # run from a worktree wrongly refuses with "No git repo".
-    assert proj_path is not None  # narrowing: is_git=True implies proj_path was set
-    if not (proj_path / ".git").exists():
-        print(f"❌ No git repo at {proj}")
-        sys.exit(1)
 
     print(f"  📂 {proj}")
 
@@ -1228,9 +1224,13 @@ def _update() -> None:
     if branch_result.returncode != 0:
         print("❌ Could not determine current branch")
         sys.exit(1)
-    branch = branch_result.stdout.strip() or "mainline"
-    if branch == "HEAD":
-        branch = "mainline"
+    branch = branch_result.stdout.strip()
+    if not branch or branch == "HEAD":
+        # Detached HEAD has no branch to fetch and no upstream to compare
+        # against. Guessing a name here produced a confusing `git fetch` failure
+        # against a branch that need not exist.
+        print("❌ Detached HEAD — check out a branch first, or update with git directly")
+        sys.exit(1)
 
     # Source pin, checked before the fetch so a blocked update never touches the
     # tree. A human at a terminal is not the authorization: the fleet decides
@@ -1310,7 +1310,7 @@ def _update() -> None:
     _ensure_node(proj)
 
     # Build the dashboard frontend assets (npm), then reinstall the package.
-    build_frontend_sync(proj_path)
+    build_frontend_sync(Path(proj))
 
     print("  🔨 pip install -e .")
     result = subprocess.run(

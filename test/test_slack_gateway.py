@@ -827,7 +827,7 @@ class TestCheckForUpdates:
             "kiro_crew.dashboard.handlers._do_update_check", new_callable=AsyncMock
         ):
             with patch(
-                "kiro_crew.dashboard.handlers._update_info", {"available": False}
+                "kiro_crew.dashboard.handlers._update_info", {"update_available": False}
             ):
                 await orch._check_for_updates()
 
@@ -843,7 +843,7 @@ class TestCheckForUpdates:
         fake_cfg = MagicMock()
         fake_cfg.auto_update = False
         try:
-            _h._update_info.update({"available": True, "version": "9.9.9"})
+            _h._update_info.update({"update_available": True, "version": "9.9.9"})
             with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
                 with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
                     await orch._check_for_updates()
@@ -868,13 +868,13 @@ class TestCheckForUpdates:
 
         orig = _h._update_info.copy()
         try:
-            # A git checkout (self_updatable) below the floor: the git auto-apply
+            # A git checkout (`can_apply`) below the floor: the git auto-apply
             # is the correct mandatory action. `_do_update_check` sets this key
             # per layout in the real flow; it is mocked here, so the fixture
-            # states the layout explicitly. The wheel layout (self_updatable
+            # states the layout explicitly. The wheel layout (no `can_apply`
             # False) takes the notify path instead — see
             # TestMandatoryUpdateOnWheelInstall.
-            _h._update_info.update({"available": False, "self_updatable": True})
+            _h._update_info.update({"update_available": False, "can_apply": True})
             with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
                 with patch(
                     "kiro_crew.platform.update_governance.update_required", return_value=True
@@ -5595,18 +5595,22 @@ class TestMandatoryUpdateOnWheelInstall:
             return None
 
         # Wheel install below a policy floor: a feed-checkable layout reports
-        # self_updatable False, and the check can leave available False (a
+        # `can_apply` False, and the check can leave `update_available` False (a
         # pre-release remote reads as not-newer) even though the floor mandates
-        # the update. Start from available False to prove the branch lights it.
+        # the update. Start from False to prove the branch lights it.
         handlers._update_info.clear()
         handlers._update_info.update(
             {
-                "available": False,
-                "self_updatable": False,
-                "install_kind": "wheel",
+                "update_available": False,
+                "can_apply": False,
+                "managed_by": "kirocrew",
                 # A feed-checkable wheel carries an installer command; that is
                 # what distinguishes it from an externally-managed install.
-                "update_command": "curl -fsSL … | sh",
+                "remediation": {
+                    "kind": "command",
+                    "message": "Re-run the installer to upgrade.",
+                    "command": "curl -fsSL … | sh",
+                },
             }
         )
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
@@ -5621,14 +5625,14 @@ class TestMandatoryUpdateOnWheelInstall:
         # Must NOT attempt the git apply on a non-git tree, and must surface it.
         apply_called.assert_not_awaited()
         ds.push_refresh.assert_called_once_with("update_available")
-        # The dashboard badge reads _update_info["available"]; a mandatory
+        # The dashboard badge reads _update_info["update_available"]; a mandatory
         # update must light it even though the check left it False.
-        assert handlers._update_info.get("available") is True
+        assert handlers._update_info.get("update_available") is True
 
     @pytest.mark.asyncio
     async def test_mandatory_update_on_externally_managed_does_not_badge(self, monkeypatch):
-        """A dmg/appimage/docker install below the floor is not self_updatable
-        AND has no installer update_command — it updates via its own surface, so
+        """A dmg/appimage/docker install below the floor has no `can_apply`
+        AND no remediation command — it updates via its own surface, so
         the CLI 'run kirocrew update' badge must NOT light."""
         import kiro_crew.dashboard.handlers as handlers
         import kiro_crew.platform.update_governance as gov
@@ -5643,10 +5647,10 @@ class TestMandatoryUpdateOnWheelInstall:
         handlers._update_info.clear()
         handlers._update_info.update(
             {
-                "available": False,
-                "self_updatable": False,
-                "install_kind": "docker",
-                "update_command": "",  # externally managed: no CLI update path
+                "update_available": False,
+                "can_apply": False,
+                "managed_by": "container",
+                "remediation": None,  # externally managed: no CLI update path
             }
         )
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
@@ -5671,10 +5675,10 @@ class TestMandatoryUpdateOnWheelInstall:
         async def _noop_check():
             return None
 
-        # Git checkout: self_updatable True, so the mandatory git apply runs.
+        # Git checkout: `can_apply` True, so the mandatory git apply runs.
         handlers._update_info.clear()
         handlers._update_info.update(
-            {"available": True, "self_updatable": True, "install_kind": "git"}
+            {"update_available": True, "can_apply": True, "managed_by": "git"}
         )
         monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
         monkeypatch.setattr(gov, "update_required", lambda _v: True)
