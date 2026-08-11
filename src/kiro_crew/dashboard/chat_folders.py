@@ -12,6 +12,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.crew_chat import CrewOrchestrator
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
@@ -551,7 +552,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pinned": slot.pinned})
 
 
-_VALID_MODES = ("", "orchestrator")
+_VALID_MODES = ("", "orchestrator", "crew")
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -569,7 +570,34 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     mode = body.get("mode", "")
     if mode not in _VALID_MODES:
         return web.json_response({"error": "invalid mode"}, status=400)
-    if slot.running:
+    # Work in SUBAGENTS keeps `slot.running` false the whole time, so that flag
+    # alone lets the mode flip mid-flight and interleave two execution models in
+    # one session. Two separate questions are needed, because the risk is not
+    # symmetric:
+    #  * ANY direction — a plain-chat subagent may be running on this slot right
+    #    now, and its completion follows the default `_run_chat` path, so
+    #    ENTERING crew mode has to be refused for that too, not just leaving it.
+    #    (Gating the whole check on `slot.mode == "crew"` missed exactly this.)
+    #  * LEAVING crew — the orchestrator may still hold crew topics or a live
+    #    queue, which only it can answer for.
+    busy = False
+    subs = getattr(state, "subagents", None)
+    if subs is not None:
+        try:
+            busy = bool(subs.has_pending_work_for(f"dashboard:{name}"))
+        except Exception:
+            busy = True       # fail closed: refuse rather than risk the flip
+    if not busy and slot.mode == "crew":
+        # isinstance, not `is not None` — matching gateway.py's own check on this
+        # attribute. A stand-in object passes an identity check and then answers
+        # `has_live_work` with something truthy, refusing a switch that is fine.
+        crew = getattr(state, "crew", None)
+        if isinstance(crew, CrewOrchestrator):
+            try:
+                busy = bool(await crew.has_live_work(name))
+            except Exception:
+                busy = True
+    if slot.running or busy:
         sel().log_api_access(
             caller="dashboard", operation="chat.slot_mode",
             outcome="denied", source="dashboard", resources=name,

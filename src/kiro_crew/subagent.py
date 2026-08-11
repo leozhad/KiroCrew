@@ -3238,8 +3238,14 @@ class SubagentManager:
         agent: str = "",
         model: str | None = None,
         max_turns: int = 0,
+        _preassigned_id: str = "",
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id*.
+
+        ``_preassigned_id`` mirrors ``spawn``: a caller that must persist the
+        dispatch identity BEFORE the side effect (so a crash in between is
+        recoverable rather than ambiguous) supplies the id it already wrote
+        down, instead of discovering the minted one only on return.
 
         Retain-by-default: works on ANY completed run whose session files are
         still on disk — no keep flag needed at spawn time. Every run's sid /
@@ -3318,6 +3324,7 @@ class SubagentManager:
         inc_memory, inc_lessons, inc_project = self._inherited_context_groups(conv_id)
         return self.spawn(
             task,
+            _preassigned_id=_preassigned_id,
             parent_session_key=parent_session_key,
             agent=agent,
             model=model,
