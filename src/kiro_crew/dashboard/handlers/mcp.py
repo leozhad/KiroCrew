@@ -13,11 +13,10 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.config.loader import config_local_path, config_path, write_config_atomically
+from kiro_crew.config.loader import _resolve_stub_servers
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.mcp_gateway import is_gateway_supported
-from kiro_crew.mcp_gateway.backend import MCP_APPS_ENV_FLAG, mcp_apps_env_override
 from kiro_crew.mcp_provenance import ABSENT, resolve_write, stamp
 from kiro_crew.mcp_utils import (
     INTERNAL_CLIENT_ID_KEY,
@@ -65,11 +64,11 @@ _KIRO_GLOBAL_SURFACE = "~/.kiro/settings/mcp.json"
 # dashboard applies at most one change per visible server, so this is generous.
 _MCP_APPLY_MAX_CHANGES = 200
 
-# Max server names accepted by one /api/mcp-gateway/servers/poolable call. The
+# Max server names accepted by one /api/mcp-gateway/servers/stub call. The
 # batch form exists for the UI's "toggle all", whose upper bound is the number of
 # configured servers, so this only fences a hand-rolled request from turning one
 # config write into an unbounded one.
-_MAX_POOLABLE_BATCH = 200
+_MAX_STUB_BATCH = 200
 
 # Bounded concurrency for the deferred capability-manager uninstall phase, so a
 # large batch neither serializes (timeout×N) nor floods the companion with N
@@ -1921,12 +1920,13 @@ async def _do_mcp_apply(request: web.Request) -> web.Response:
 
 
 async def api_mcp_gateway_status(request: web.Request) -> web.Response:
-    """GET /api/mcp-gateway/status — shared MCP gateway state.
+    """GET /api/mcp-gateway/status — MCP gateway state.
 
-    ``enabled`` reflects the persisted config flag; ``running``/``ping_ok``
-    reflect the live broker held by the gateway orchestrator.  The broker is
-    only spawned at startup when the flag is on, so a freshly-flipped flag
-    reads ``enabled=true`` with ``running=false`` until the restart lands.
+    ``enabled`` is the persisted backend-sharing flag; ``running``/``ping_ok``
+    reflect the live broker held by the gateway orchestrator. The broker runs iff
+    something is stubbed, so ``stub_count == 0`` with ``running=false`` is the
+    default install, not a fault. A freshly-flipped flag reads its new value with
+    ``running`` still stale until the restart lands.
     """
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
 
@@ -1938,11 +1938,12 @@ async def api_mcp_gateway_status(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "enabled": cfg.enabled,
-            # Reported independently of ``enabled`` so the UI can show the
-            # render switch's own state while explaining that the broker gates
-            # it — collapsing them here would make an off-broker look like an
-            # opted-out one.
-            "apps_enabled": cfg.apps_enabled,
+            # The stub set is what the sharing switch acts on, so the UI needs
+            # it to say what turning sharing on will affect. Sent as a count and
+            # a list: the count drives the header line, the list drives each
+            # row's own control without a second request.
+            "stub": sorted(cfg.stub_servers),
+            "stub_count": len(cfg.stub_servers),
             "running": bool(running),
             "ping_ok": bool(ping_ok),
             # Whether the broker can run on this OS at all. The UI reads this to
@@ -1951,174 +1952,6 @@ async def api_mcp_gateway_status(request: web.Request) -> web.Response:
             "supported": is_gateway_supported(),
         }
     )
-
-
-def _apps_enabled_overlay_owned() -> bool:
-    """Whether ``config.local.json`` decides ``mcp_gateway.apps_enabled``.
-
-    The overlay deep-merges OVER ``config.json`` at load while this endpoint
-    writes the BASE file, so anything in the overlay that changes how this key
-    resolves makes a successful write have no effect on the value the gateway
-    reads. For a switch that suppresses executing server-authored UI, silently
-    accepting such a write is the worst outcome available: the user is told their
-    opt-out landed while rendering continues.
-
-    Two shapes qualify, and the second is easy to miss:
-
-    * ``mcp_gateway`` is an object containing ``apps_enabled`` — it pins the key
-      directly.
-    * ``mcp_gateway`` is present but NOT an object (``null``, a string, a list).
-      ``_deep_merge`` replaces rather than merges a non-dict value ("All other
-      types in overlay replace base values"), so the base section is wiped
-      wholesale; schema validation then strips the invalid value and the
-      dataclass defaults restore ``apps_enabled=True``. The base file's opt-out
-      is masked without the key ever appearing in the overlay.
-
-    Best-effort: an unreadable or unparseable overlay is reported as "not owned"
-    rather than raising, so a broken overlay cannot wedge the endpoint.
-    """
-    try:
-        path = config_local_path()
-        if not path.exists():
-            return False
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(data, dict) or "mcp_gateway" not in data:
-        return False
-    section = data["mcp_gateway"]
-    if not isinstance(section, dict):
-        return True
-    return "apps_enabled" in section
-
-
-async def api_mcp_gateway_apps_enable(request: web.Request) -> web.Response:
-    """POST /api/mcp-gateway/apps-enable — set ``mcp_gateway.apps_enabled``.
-
-    Body: ``{"enabled": bool}``. Returns ``{ok, enabled}``.
-
-    Config-only, with no broker apply step: the daemon reads this flag per
-    tool-result via ``_mcp_apps_enabled()``, so a running broker observes the
-    change on its next call. That also means the flag is honoured by an *adopted*
-    daemon the current gateway did not spawn and cannot restart.
-    """
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular: agents imports mcp
-
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    # A JSON array or scalar parses fine but has no ``.get``, so the type check
-    # has to precede field access or the handler raises AttributeError -> 500.
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
-        )
-    enabled = body.get("enabled")
-    if not isinstance(enabled, bool):
-        return web.json_response(
-            {"error": "enabled must be a boolean", "code": "invalid_value"}, status=400
-        )
-
-    # Refuse only writes that would be INERT. Two layers outrank the base config
-    # file, but they do not outrank it symmetrically:
-    #   * config.local.json deep-merges over the base, so it owns the key in
-    #     both directions.
-    #   * the env flag is tightest-wins in _mcp_apps_enabled, so an explicit
-    #     apps_enabled=false now takes effect even with the env on — disabling
-    #     is always effective, and only ENABLING against an env "off" is inert.
-    if enabled and mcp_apps_env_override() is False:
-        sel().log_api_access(
-            caller=request.get("user", "dashboard"),
-            operation="mcp_gateway_apps_enable",
-            outcome="denied",
-            resources="apps_enabled=env_override",
-        )
-        return web.json_response(
-            {
-                "error": f"{MCP_APPS_ENV_FLAG} is set to off in the environment and "
-                "overrides this setting; unset it to enable MCP Apps here",
-                "code": "apps_enabled_env_override",
-            },
-            status=409,
-        )
-
-    if await asyncio.to_thread(_apps_enabled_overlay_owned):
-        sel().log_api_access(
-            caller=request.get("user", "dashboard"),
-            operation="mcp_gateway_apps_enable",
-            outcome="denied",
-            resources="apps_enabled=overlay_owned",
-        )
-        return web.json_response(
-            {
-                "error": "mcp_gateway.apps_enabled is set in config.local.json; "
-                "edit that file instead",
-                "code": "apps_enabled_overlay_owned",
-            },
-            status=409,
-        )
-
-    path = config_path()
-    async with _get_config_lock():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            # UnicodeDecodeError is a ValueError, NOT an OSError or a
-            # JSONDecodeError, so invalid UTF-8 bytes escape a tuple naming only
-            # those two and surface as an uncoded 500.
-            return web.json_response(
-                {"error": "config.json is corrupt", "code": "config_corrupt"}, status=500
-            )
-        # A top-level array or scalar is valid JSON but has no ``setdefault``, so
-        # this has to precede the mapping access or the handler raises
-        # AttributeError and the caller sees an uncoded 500.
-        if not isinstance(data, dict):
-            return web.json_response(
-                {"error": "config.json is corrupt", "code": "config_corrupt"}, status=500
-            )
-        section = data.setdefault("mcp_gateway", {})
-        if not isinstance(section, dict):
-            return web.json_response(
-                {"error": "mcp_gateway is not an object", "code": "config_corrupt"}, status=500
-            )
-        section["apps_enabled"] = enabled
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            # ``write_config_atomically``, not the generic agent-JSON writer:
-            # config.json can hold inline credentials, and tmp+rename creates a
-            # new inode, so the generic writer's 0644 default for a
-            # not-yet-existing file would leave a fresh config world-readable and
-            # later credential-bearing saves would preserve that mode. This
-            # helper carries an existing file's mode over and defaults a new one
-            # to owner-only.
-            write_config_atomically(path, data)
-        except OSError as exc:
-            # The write is the whole operation: reporting success without it
-            # would tell a user their opt-out landed while server-authored UI
-            # keeps rendering. ``_atomic_json_write`` already re-raises (it only
-            # swallows the temp-file cleanup), so the failure is observable —
-            # what this adds is an AUDITED, coded response instead of an
-            # unstructured 500 from an unhandled exception.
-            sel().log_api_access(
-                caller=request.get("user", "dashboard"),
-                operation="mcp_gateway_apps_enable",
-                outcome="error",
-                resources=f"apps_enabled={enabled}",
-                error=str(exc),
-            )
-            return web.json_response(
-                {"error": "could not write config.json", "code": "config_write_failed"},
-                status=500,
-            )
-
-    sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="mcp_gateway_apps_enable",
-        outcome="success",
-        resources=f"apps_enabled={enabled}",
-    )
-    return web.json_response({"ok": True, "enabled": enabled})
 
 
 async def api_mcp_gateway_metrics(request: web.Request) -> web.Response:
@@ -2137,7 +1970,7 @@ async def api_mcp_gateway_metrics(request: web.Request) -> web.Response:
     return web.json_response({"running": True, **snap})
 
 
-# Serializes in-process gateway apply operations (enable/disable + set-poolable)
+# Serializes in-process gateway apply operations (enable/disable + set-stub)
 # so two concurrent dashboard requests cannot interleave broker start/stop and
 # orphan a gatewayd process. The config write is guarded by _get_config_lock();
 # this lock guards the apply() side effect that runs AFTER that lock is released.
@@ -2149,7 +1982,7 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
 
     Writes ``mcp_gateway.enabled`` to config.json then applies the change
     live: the broker is started/stopped and all agent sessions are dropped +
-    relinked to the new MCP routing — without restarting the gateway process,
+    relinked to the new stub set — without restarting the gateway process,
     so the dashboard session stays authenticated.  Returns the verified state
     ``{ok, enabled, running, ping_ok}``.
     """
@@ -2228,19 +2061,22 @@ async def api_mcp_gateway_enable(request: web.Request) -> web.Response:
 async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     """GET /api/mcp-gateway/servers — enumerate distinct MCP servers.
 
-    Reads ``~/.kiro/agents/*.json`` (the clean source specs — the rewriter
-    never mutates them) and returns one row per distinct server with its
-    effective poolable state.  Pooling is opt-in: a stdio server is pooled
-    only when its name is in the config allowlist
-    (``mcp_gateway.poolable_servers``) OR its agent-JSON entry sets
-    ``poolable:true``.  HTTP/SSE servers are shared by nature (not poolable);
-    denylisted servers (``UNPOOLABLE_SERVERS``) can never be pooled.
+    Reads ``~/.kiro/agents/*.json`` (the clean source specs — the rewriter never
+    mutates them) and returns one row per distinct server with its effective
+    STUB state. The stub is opt-in: a stdio server is stubbed only when its name
+    is in ``mcp_gateway.stub_servers`` OR its agent-JSON entry sets
+    ``poolable:true`` (the per-spec spelling, kept for specs that opt a server in
+    directly). HTTP/SSE servers cannot be stubbed — there is no stdio pipe to
+    interpose on — and denylisted servers (``UNPOOLABLE_SERVERS``) never are.
+
+    Whether a stubbed server SHARES its backend is not per-row: that is the one
+    global switch (``mcp_gateway.enabled``), reported by the status endpoint.
     """
     from kiro_crew.agent import kiro_agents_dir_path
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
     from kiro_crew.mcp_gateway.rewriter import UNPOOLABLE_SERVERS
 
-    allowlist = set(KiroCrewConfig.load().mcp_gateway.poolable_servers)
+    stub_set = set(KiroCrewConfig.load().mcp_gateway.stub_servers)
 
     rows: dict[str, dict[str, Any]] = {}
     agents_dir = kiro_agents_dir_path()
@@ -2276,12 +2112,24 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
         row = rows[name]
         is_stdio = row["transport"] == "stdio"
         denylisted = name in UNPOOLABLE_SERVERS
-        effective = is_stdio and not denylisted and (name in allowlist or row["entry_poolable"])
+        # Separated on purpose: ``can_stub`` is a property of the server (is
+        # there a stdio pipe, is it denylisted) while ``stub`` is the
+        # operator's choice. The UI needs both — one disables the control, the
+        # other sets it — and collapsing them would make an unstubbable server
+        # look like one the operator declined.
+        can_stub = is_stdio and not denylisted
+        # ``stub_servers`` is the only thing that produces a stub, so it is the
+        # only thing this row may report. ``entry_poolable`` is still returned
+        # below as information — a spec-level ``poolable: true`` no longer opts a
+        # server in, and reading it as "stubbed" here made the row claim a stub
+        # the broker had not created.
+        stubbed = can_stub and name in stub_set
         result.append(
             {
                 "name": name,
-                "poolable": effective,
-                "in_allowlist": name in allowlist,
+                "stub": stubbed,
+                "can_stub": can_stub,
+                "in_allowlist": name in stub_set,
                 "entry_poolable": row["entry_poolable"],
                 "agents": sorted(row["agents"]),
                 "transport": row["transport"],
@@ -2291,14 +2139,14 @@ async def api_mcp_gateway_servers(request: web.Request) -> web.Response:
     return web.json_response({"servers": result})
 
 
-async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
-    """POST /api/mcp-gateway/servers/poolable — toggle servers' poolable flag.
+async def api_mcp_gateway_set_stub(request: web.Request) -> web.Response:
+    """POST /api/mcp-gateway/servers/stub — toggle servers' stub flag.
 
-    Body ``{"name": "slack-mcp", "poolable": true}`` for one server, or
-    ``{"names": ["a-mcp", "b-mcp"], "poolable": true}`` for several.  Adds or
-    removes those names from ``mcp_gateway.poolable_servers`` in config.json
+    Body ``{"name": "slack-mcp", "stub": true}`` for one server, or
+    ``{"names": ["a-mcp", "b-mcp"], "stub": true}`` for several.  Adds or
+    removes those names from ``mcp_gateway.stub_servers`` in config.json
     (same config lock + atomic write as the enable toggle), then re-applies the
-    change in-process so new sessions pick up the new MCP routing without a
+    change in-process so new sessions pick up the new stub set without a
     restart.  When the gateway is disabled, the allowlist is persisted only (it
     takes effect when the gateway is enabled).
 
@@ -2307,8 +2155,8 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
     user gesture, each one racing the others for the config lock.  One request
     means one write and one apply, so the allowlist can never land half-flipped.
 
-    Returns ``{ok, name, poolable, ...}`` for the single form and
-    ``{ok, names, poolable, ...}`` for the batch form.
+    Returns ``{ok, name, stub, ...}`` for the single form and
+    ``{ok, names, stub, ...}`` for the batch form.
     """
     from kiro_crew.agent import _atomic_json_write
     from kiro_crew.config.loader import config_path  # noqa: F811
@@ -2324,7 +2172,7 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
         )
     name = str(body.get("name", "")).strip()
     raw_names = body.get("names")
-    poolable = body.get("poolable")
+    stub = body.get("stub")
     batch = raw_names is not None
     if batch:
         if not isinstance(raw_names, list) or not all(
@@ -2342,10 +2190,10 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "names is required", "code": "names_required"}, status=400
             )
-        if len(names) > _MAX_POOLABLE_BATCH:
+        if len(names) > _MAX_STUB_BATCH:
             return web.json_response(
                 {
-                    "error": f"names must hold at most {_MAX_POOLABLE_BATCH} servers",
+                    "error": f"names must hold at most {_MAX_STUB_BATCH} servers",
                     "code": "names_too_many",
                 },
                 status=400,
@@ -2361,8 +2209,8 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
         if not _is_valid_mcp_name(name):
             return web.json_response({"error": "invalid server name"}, status=400)
         names = [name]
-    if not isinstance(poolable, bool):
-        return web.json_response({"error": "poolable must be a boolean"}, status=400)
+    if not isinstance(stub, bool):
+        return web.json_response({"error": "stub must be a boolean"}, status=400)
 
     path = config_path()
     async with _get_config_lock():
@@ -2373,18 +2221,23 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
         section = data.setdefault("mcp_gateway", {})
         if not isinstance(section, dict):
             return web.json_response({"error": "mcp_gateway is not an object"}, status=500)
-        current = section.get("poolable_servers")
-        servers_set = {s for s in current if isinstance(s, str)} if isinstance(current, list) else set()
-        if poolable:
+        # Seed from the SAME resolver the runtime reads, not from the raw key.
+        # On a legacy install the effective set comes from the deprecated
+        # `poolable_servers`, and reading the raw `stub_servers` here would see
+        # nothing: the first toggle would then persist only the server just
+        # clicked and silently unstub everything the migration was preserving.
+        current = _resolve_stub_servers(section)
+        servers_set = set(current)
+        if stub:
             servers_set |= set(names)
         else:
             servers_set -= set(names)
-        section["poolable_servers"] = sorted(servers_set)
+        section["stub_servers"] = sorted(servers_set)
         path.parent.mkdir(parents=True, exist_ok=True)
         _atomic_json_write(path, data)
 
     state: DashboardState = request.app["state"]
-    apply = getattr(state, "_mcp_gateway_apply_poolable", None)
+    apply = getattr(state, "_mcp_gateway_apply_stub", None)
     applied: dict[str, Any] = {"applied": False}
     # One apply for the whole batch: the allowlist is already fully written, so a
     # single re-link picks up every name at once.
@@ -2396,19 +2249,19 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
         except Exception as exc:
             sel().log_api_access(
                 caller=request.get("user", "dashboard"),
-                operation="mcp_gateway_set_poolable",
+                operation="mcp_gateway_set_stub",
                 outcome="error",
                 source="dashboard",
-                resources=f"{audited} poolable={poolable} error={exc}",
+                resources=f"{audited} stub={stub} error={exc}",
             )
             return web.json_response({"error": f"apply failed: {exc}"}, status=500)
 
     sel().log_api_access(
         caller=request.get("user", "dashboard"),
-        operation="mcp_gateway_set_poolable",
+        operation="mcp_gateway_set_stub",
         outcome="ok",
         source="dashboard",
-        resources=f"{audited} poolable={poolable}",
+        resources=f"{audited} stub={stub}",
     )
     subject: dict[str, Any] = {"names": names} if batch else {"name": name}
-    return web.json_response({"ok": True, **subject, "poolable": poolable, **applied})
+    return web.json_response({"ok": True, **subject, "stub": stub, **applied})

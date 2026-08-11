@@ -78,19 +78,31 @@ class TestFlagOff:
         ext = out["params"]["capabilities"]["extensions"]
         assert ext[MCP_APPS_EXTENSION_KEY] == {"mimeTypes": [MCP_APPS_MIME_TYPE]}
 
-    def test_unset_respects_apps_opt_out(self, monkeypatch):
-        """Apps switched off => no capability, even with the env var unset.
+    def test_env_kill_switch_withholds_the_capability(self, monkeypatch):
+        """The one remaining way to serve a stubbed server without its UI.
 
-        This is the adopted-daemon case: ``_shutdown_locked`` refuses to
-        terminate a daemon it did not spawn, so a survivor keeps serving stubs
-        after the operator switches the feature off. Keying the gate on "am I
-        running" would keep intercepting results and spooling payloads (which
-        carry a callback_secret) after an explicit opt-out.
+        This is also the adopted-daemon case: ``_shutdown_locked`` refuses to
+        terminate a daemon it did not spawn, so a survivor keeps serving stubs.
+        The kill switch is read in the process that renders, so it takes effect
+        there without any cross-process probe of anyone's environment.
+        """
+        monkeypatch.setenv(MCP_APPS_ENV_FLAG, "0")
+        msg = _init_frame(capabilities={})
+        assert _inject_client_extensions(msg) is msg
+
+    def test_deprecated_config_opt_out_no_longer_withholds(self, monkeypatch):
+        """``apps_enabled=false`` ships in released configs and must now be inert.
+
+        Capability follows the stub: reaching this code means a stub already
+        arrived for a server the operator stubbed, so an old preference cannot
+        speak for a decision it never described.
         """
         monkeypatch.delenv(MCP_APPS_ENV_FLAG, raising=False)
         _patch_pooling(monkeypatch, enabled=True, apps_enabled=False)
         msg = _init_frame(capabilities={})
-        assert _inject_client_extensions(msg) is msg
+        out = _inject_client_extensions(msg)
+        assert out is not msg
+        assert MCP_APPS_EXTENSION_KEY in out["params"]["capabilities"]["extensions"]
 
     def test_pooling_opt_out_does_not_disable_apps(self, monkeypatch):
         """Turning pooling off must not take MCP Apps down with it.
@@ -117,8 +129,13 @@ class TestFlagOff:
         out = _inject_client_extensions(_init_frame(capabilities={}))
         assert MCP_APPS_EXTENSION_KEY in out["params"]["capabilities"]["extensions"]
 
-    def test_unreadable_config_fails_closed(self, monkeypatch):
-        """A config we cannot read must not enable the feature."""
+    def test_unreadable_config_is_irrelevant(self, monkeypatch):
+        """The gate reads no config, so an unreadable one cannot withhold UI.
+
+        Mutation guard: restoring a config read here would also restore the
+        fail-closed branch, and a stubbed server would silently lose its UI on a
+        transient config read error.
+        """
         monkeypatch.delenv(MCP_APPS_ENV_FLAG, raising=False)
         import kiro_crew.config.loader as loader
 
@@ -127,7 +144,9 @@ class TestFlagOff:
 
         monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(_boom))
         msg = _init_frame(capabilities={})
-        assert _inject_client_extensions(msg) is msg
+        out = _inject_client_extensions(msg)
+        assert out is not msg
+        assert MCP_APPS_EXTENSION_KEY in out["params"]["capabilities"]["extensions"]
 
 
 class TestFlagOn:
