@@ -8708,7 +8708,7 @@
       "by_category": "Per categoria",
       "clear": "Cancella",
       "clear_old_caches": "Cancella le vecchie cache",
-      "delete_cached_scroll_positions_from_old_sessions": "Elimina le posizioni di scorrimento memorizzate nella cache dalle vecchie sessioni (sicuro — si ricostruiscono automaticamente)",
+      "delete_cached_scroll_positions_from_old_sessions": "Elimina le altezze di riga memorizzate nella cache e le posizioni di lettura salvate dalle vecchie sessioni (sicuro — si ricostruiscono durante lo scorrimento)",
       "delete_key": "Elimina chiave",
       "export": "Esporta",
       "export_json": "Esporta JSON",

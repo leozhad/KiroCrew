@@ -5838,7 +5838,7 @@
       "by_category": "By Category",
       "clear": "Clear",
       "clear_old_caches": "Clear Old Caches",
-      "delete_cached_scroll_positions_from_old_sessions": "Delete cached scroll positions from old sessions (safe — rebuilds automatically)",
+      "delete_cached_scroll_positions_from_old_sessions": "Delete cached row heights and saved reading positions from old sessions (safe — rebuilt as you scroll)",
       "delete_key": "Delete key",
       "export": "Export",
       "export_json": "Export JSON",

@@ -8598,7 +8598,7 @@
       "by_category": "Nach Kategorie",
       "clear": "Leeren",
       "clear_old_caches": "Alte Caches leeren",
-      "delete_cached_scroll_positions_from_old_sessions": "Zwischengespeicherte Scrollpositionen alter Sitzungen löschen (sicher — wird automatisch neu aufgebaut)",
+      "delete_cached_scroll_positions_from_old_sessions": "Zwischengespeicherte Zeilenhöhen und gespeicherte Lesepositionen alter Sitzungen löschen (sicher — wird beim Scrollen neu aufgebaut)",
       "delete_key": "Schlüssel löschen",
       "export": "Exportieren",
       "export_json": "JSON exportieren",

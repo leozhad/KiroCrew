@@ -8488,7 +8488,7 @@
       "by_category": "カテゴリ別",
       "clear": "クリア",
       "clear_old_caches": "古いキャッシュをクリア",
-      "delete_cached_scroll_positions_from_old_sessions": "古いセッションからキャッシュされたスクロール位置を削除します (安全 — 自動的に再構築されます)",
+      "delete_cached_scroll_positions_from_old_sessions": "古いセッションからキャッシュされた行の高さと保存された読書位置を削除します (安全 — スクロール時に再構築されます)",
       "delete_key": "キーを削除",
       "export": "エクスポート",
       "export_json": "JSON をエクスポート",
