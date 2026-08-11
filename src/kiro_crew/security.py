@@ -4121,6 +4121,12 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     ".local/share/amazon-q",
     "Library/Application Support/kiro-cli",
     "Library/Application Support/amazon-q",
+    # Windows layout of the same stores (%APPDATA% defaults to
+    # ~/AppData/Roaming). This matcher is home-anchored, so a Roaming profile
+    # redirected outside the home directory is not covered — the default
+    # location is what agent file tools can reach by a fixed relative path.
+    "AppData/Roaming/kiro-cli",
+    "AppData/Roaming/amazon-q",
 ]
 
 # ── KiroCrew's own data-home secrets & governance trust-root ──
@@ -4559,6 +4565,64 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # ``marker.exists()``) is caught, not just the exact-leaf forms.
         rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
     )
+    # Windows-native spellings of the same fenced dirs, matched in the RAW
+    # command text. POSIX shlex consumes unquoted backslashes during
+    # tokenization, and an embedded interpreter script
+    # (``python -c "open(r'C:\\Users\\u\\.aws\\credentials')"``) never
+    # tokenizes into a path at all — so this raw pass, which already catches
+    # embedded scripts for the POSIX spellings above, is the only layer that
+    # can see a native spelling. Anchors: the resolved home literal (on
+    # Windows it contains backslashes), a generic drive-letter home with
+    # either separator, a UNC prefix, ``%USERPROFILE%``, and ``~``/``$HOME``.
+    # Entry-internal separators accept both slashes; naming a fenced dir is
+    # itself the signal (same fail-safe posture as the branches above), so
+    # over-matching an odd mixed-separator spelling is the safe direction.
+    win_sep = r"[\\/]"
+    win_dirs_pattern = "|".join(
+        win_sep.join(re.escape(part) for part in d.split("/"))
+        for d in _SENSITIVE_HOME_DIRS
+    )
+    generic_win_home = rf"[A-Za-z]:{win_sep}(?:Users|home){win_sep}[^\\/\s'\"]+"
+    unc_prefix = r"\\\\[^\s'\"]+"
+    # cmd.exe and PowerShell spellings of the profile variable both anchor a
+    # home-relative fenced path. The cmd.exe form tolerates expansion
+    # modifiers (``%USERPROFILE:~0%``, ``%USERPROFILE:a=b%``), and the
+    # PowerShell form is accepted braced (``${env:USERPROFILE}``) or bare —
+    # all expand to the same location.
+    userprofile = (
+        r"(?:%USERPROFILE(?::[^%\s]*)?%"
+        rf"|{re.escape('$env:USERPROFILE')}"
+        rf"|{re.escape('${env:USERPROFILE}')})"
+    )
+    win_home_alts = (
+        f"(?:{home}|{generic_win_home}|{unc_prefix}|{userprofile}|{tilde}|{home_var})"
+    )
+    # A single-dot segment (``\.\``) is canonical-equivalent to its absence,
+    # so tolerate any number of them between the anchor and the fenced
+    # remainder — otherwise ``%APPDATA%\.\kiro-cli\data.sqlite3`` names the
+    # store while missing the adjacency match.
+    dot_seg = rf"(?:{win_sep}\.)*{win_sep}"
+    win_sensitive_path = (
+        rf"{win_home_alts}{dot_seg}(?:{win_dirs_pattern})(?:{win_sep}|\s|$|['\"])"
+    )
+    # ``%APPDATA%`` already points INTO ``AppData\Roaming``, so a spelling like
+    # ``%APPDATA%\kiro-cli\data.sqlite3`` names a fenced store WITHOUT the
+    # ``AppData\Roaming`` text the branch above anchors on. Map the variable
+    # directly onto that prefix: entries under ``AppData/Roaming/`` are matched
+    # by their remainder.
+    appdata_var = (
+        r"(?:%APPDATA(?::[^%\s]*)?%"
+        rf"|{re.escape('$env:APPDATA')}"
+        rf"|{re.escape('${env:APPDATA}')})"
+    )
+    appdata_remainders = "|".join(
+        win_sep.join(re.escape(part) for part in d.split("/")[2:])
+        for d in _SENSITIVE_HOME_DIRS
+        if d.startswith("AppData/Roaming/")
+    )
+    appdata_sensitive_path = (
+        rf"{appdata_var}{dot_seg}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+    )
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -4573,7 +4637,13 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"(?:(?:{_READ_CMDS}.*|{_WRITE_CMDS}.*|{_SCRIPT_OPEN}.*|.*[<>|]\s*)"
         rf"{sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){sensitive_path}"
-        rf"|(?:^|.*[\s'\"=:,;]){write_protected_path})",
+        rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
+        # (4) Windows-native spelling, verb-independent (same token anchor):
+        # covers quoted backslash paths AND embedded-script literals that the
+        # tokenizing passes cannot see. (5) the %APPDATA% alias of the fenced
+        # Roaming stores.
+        rf"|(?:^|.*[\s'\"=:,;]){win_sensitive_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){appdata_sensitive_path})",
         re.IGNORECASE,
     )
 
@@ -4981,8 +5051,16 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
 # the CREATION verbs (``ln``, ``cp -s``/``--symbolic-link``) when any token
 # names a sensitive dir via dot-slash traversal.
 _SENSITIVE_SEGMENT_ALT = "|".join(re.escape(d) for d in _SENSITIVE_HOME_DIRS)
+# Same alternation with either separator accepted between segments, so the
+# Windows-native relative spelling (``..\..\.aws\credentials``) is caught by
+# the traversal matcher below alongside the POSIX one. Forward-slash-only
+# entries still match (the class includes ``/``), so this strictly widens.
+_SENSITIVE_SEGMENT_ALT_ANYSEP = "|".join(
+    r"[\\/]".join(re.escape(part) for part in d.split("/"))
+    for d in _SENSITIVE_HOME_DIRS
+)
 _RELATIVE_SENSITIVE_RE = re.compile(
-    rf"(?:^|[\s'\"=:,;])(?:\.\.?/)+(?:{_SENSITIVE_SEGMENT_ALT})(?:/|\s|$|['\"])",
+    rf"(?:^|[\s'\"=:,;])(?:\.\.?[\\/])+(?:{_SENSITIVE_SEGMENT_ALT_ANYSEP})(?:[\\/]|\s|$|['\"])",
     re.IGNORECASE,
 )
 
@@ -7729,6 +7807,11 @@ def resolve_command_paths(tokens: list[str]) -> list[str]:
     return resolved
 
 
+# Drive-letter absolute path (``C:\...`` or ``C:/...``). Anchored to a single
+# ASCII letter + colon + separator so ``key:value`` option tokens do not match.
+_WIN_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def _is_path_like(token: str) -> bool:
     """Heuristic: does this token look like a filesystem path?"""
     if not token:
@@ -7741,6 +7824,44 @@ def _is_path_like(token: str) -> bool:
         return True
     # Relative with explicit directory prefix
     if token.startswith("./") or token.startswith("../"):
+        return True
+    # Windows-native shapes. The shell tool runs on native Windows, where the
+    # sensitive-path fence compares casefolded ``os.sep``-joined targets — a
+    # backslash spelling must reach ``is_sensitive_path()`` through the
+    # normalizer pass, or every fenced dir is reachable through the shell gate
+    # on Windows hosts. A match on the drive (or UNC share) holding
+    # ``Path.home()`` is recognized directly; anything else FALLS THROUGH to
+    # the generic checks below rather than being rejected here. That keeps two
+    # properties at once: a forward-slash spelling on another drive
+    # (``D:/kirocrew/security_policy.json`` under a cross-drive
+    # ``KIROCREW_HOME``) stays path-like exactly as it was before these shapes
+    # were recognized, so the keystone fence is not narrowed — while a
+    # pure-backslash foreign-drive token gains no NEW recognition, since
+    # probing it would only feed ``os.path.realpath`` a disconnected mapped
+    # drive or dead UNC host (a synchronous network stall on the caller).
+    if _WIN_DRIVE_PATH_RE.match(token):
+        home_str = str(Path.home())
+        if (
+            len(home_str) >= 3
+            and home_str[1] == ":"
+            and home_str[2] in "\\/"
+            and token[:2].casefold() == home_str[:2].casefold()
+        ):
+            return True
+    elif token.startswith("\\\\"):
+        home_str = str(Path.home())
+        if home_str.startswith("\\\\"):
+            # Compare the ``\\server\share`` prefix (first four ``\``-split
+            # parts: '', '', server, share) at a path-segment boundary, so a
+            # share that merely shares a name prefix (``\\srv\homes-dead``)
+            # is not probed.
+            share = "\\".join(home_str.casefold().split("\\")[:4])
+            token_cf = token.casefold()
+            if token_cf == share or token_cf.startswith((share + "\\", share + "/")):
+                return True
+    # Backslash-relative traversal resolves against the CWD (local, no
+    # network), so it stays unconditional.
+    if token.startswith(".\\") or token.startswith("..\\"):
         return True
     # Contains path separator and has directory component (not a flag)
     if "/" in token and not token.startswith("-"):

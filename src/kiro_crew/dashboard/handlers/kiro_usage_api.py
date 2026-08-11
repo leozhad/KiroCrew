@@ -134,9 +134,25 @@ _JSON_TOKEN_READ_IDS = (
 # exactly this path.
 # ``~/.local/share`` is not a sensitive credential path, so this read is a direct
 # read-only sqlite open. auth_kv holds a JSON blob per key.
+#
+# The entries are deliberately UNGUARDED by ``sys.platform``: every candidate is
+# existence-checked before it is opened, so a path that cannot exist on the
+# running OS is inert, and a platform-independent module constant is what lets
+# tests patch the tuple without becoming host-dependent.
+#
+# The Windows entry is the fixed default Roaming location, NOT resolved from
+# ``%APPDATA%``. Membership here is a trust claim (``from_cli_store=True``)
+# that rests on agent file tools being unable to write the store, and that
+# fence (``_SENSITIVE_HOME_DIRS``) is home-anchored at exactly this path — so
+# an APPDATA-resolved location either equals this entry or falls outside the
+# fence and must not be trusted. A redirected Roaming profile therefore keeps
+# the text-scrape fallback rather than gaining a forgeable trusted path; the
+# same posture as the Linux entry, which does not follow ``XDG_DATA_HOME``
+# redirection either.
 _CLI_SQLITE_DBS = (
     Path.home() / ".local" / "share" / "kiro-cli" / "data.sqlite3",
     Path.home() / "Library" / "Application Support" / "kiro-cli" / "data.sqlite3",
+    Path.home() / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3",
 )
 
 # Auth stores belonging to OTHER products (amazon-q). Readable, and often the same
