@@ -323,7 +323,12 @@ class TestWriteConfigAtomically:
 
         path = tmp_path / "config.json"
         write_config_atomically(path, {"auto_update": True})
-        assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
+        # The lock sidecar is expected and is NOT litter: flock needs an inode that
+        # outlives the write it guards, so it is persistent by design (dot-prefixed to
+        # stay out of the user's directory listing). What this test still forbids is a
+        # leftover *temp* file from the atomic write.
+        left = sorted(p.name for p in tmp_path.iterdir())
+        assert left == [".config.json.lock", "config.json"], left
 
 
 class TestAutoUpdateToggleKeepsSettings:

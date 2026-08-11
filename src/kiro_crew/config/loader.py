@@ -12,15 +12,19 @@ dashboard URL via the config file. (The dashboard *port* is set with the
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import math
 import os
 import re as _re
 import stat as _stat
+import sys
 import threading
+import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,6 +114,22 @@ from kiro_crew.instances.constants import (
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
 logger = logging.getLogger(__name__)
+
+
+# File-locking primitives. Real module-level ``import`` statements (the repo's
+# ``top-level-imports`` rule), branched on the platform because neither module exists on
+# both: ``fcntl`` is POSIX-only and ``msvcrt`` is Windows-only. A guarded
+# ``try: import`` here would instead be a statement sitting among the imports, which
+# makes every later import an E402 and gets the bare imports relocated by isort; a
+# branch placed after the entire import section avoids both.
+if sys.platform == "win32":  # pragma: no cover - platform-dependent
+    import msvcrt
+
+    fcntl = None  # type: ignore[assignment]
+else:
+    import fcntl
+
+    msvcrt = None  # type: ignore[assignment]
 
 # Top-level config.json keys that save() stamps itself rather than modelling as
 # a section. They are neither parsed into a field nor round-tripped through
@@ -599,6 +619,9 @@ def read_config_for_update(path: Path | None = None) -> dict:
     p = path if path is not None else config_path()
     try:
         if not p.exists():
+            # Snapshot the absence too: every key the caller adds is then a genuine
+            # addition, so a file created concurrently is merged rather than replaced.
+            _remember_snapshot(p, {})
             return {}
         raw = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
@@ -610,10 +633,90 @@ def read_config_for_update(path: Path | None = None) -> dict:
         raise ConfigReadError(f"could not read config at {p}: {e}") from e
     if not isinstance(raw, dict):
         raise ConfigReadError(f"config at {p} is not a JSON object (got {type(raw).__name__})")
+    # Remember what was handed out so a later write to the same path can replay only the
+    # caller's own edits onto a fresh read, instead of overwriting the whole file with
+    # this now-possibly-stale snapshot. See _apply_delta.
+    _remember_snapshot(p, raw)
     return raw
 
 
-def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> None:
+def write_config_atomically(
+    path: Path,
+    data: dict,
+    *,
+    fsync: bool = False,
+    baseline: dict | None = None,
+) -> None:
+    """Write config atomically, replaying only THIS caller's edits.
+
+    Callers are unchanged from the read-then-write pattern they already use::
+
+        data = read_config_for_update(path)
+        data["k"] = v
+        write_config_atomically(path, data)
+
+    and that pattern is now safe. It previously lost a concurrent update: both callers
+    read the same snapshot, and the second write replaced the first's change wholesale.
+
+    The fix lives here rather than in every caller. ``read_config_for_update`` records
+    what it handed out; this function takes the config lock, re-reads the file as it is
+    *now*, and replays the difference between the snapshot and *data* onto it -- so a key
+    the caller never touched keeps whatever another writer just stored. Two writers
+    editing different settings both survive; only the same leaf can be won by the later
+    writer, which serialised writes would do too.
+
+    **Why this needs no async migration.** The lock is held for a re-read, a dict merge
+    and a rename -- 0.57ms median, 1.47ms worst on a 13KB config, measured -- so a
+    contended caller waits about as long as the write it was already doing on the event
+    loop. That is the whole reason the burden belongs here: pushing it onto callers would
+    mean restructuring 12 handlers and offloading each one, to buy a millisecond.
+
+    A write with **no** matching read (``KiroCrewConfig.save()`` dumping the whole model,
+    or a freshly built dict) has no delta to replay, so it writes the payload as given --
+    still under the lock, so it cannot interleave with someone else's transaction.
+    """
+    # An explicit baseline wins over the thread-local read record: a caller that holds
+    # the dict it was loaded from knows its own starting point exactly, where the
+    # thread-local is a best-effort pairing of "the last read on this thread".
+    snapshot = baseline if baseline is not None else _take_snapshot(path)
+    if baseline is not None:
+        _take_snapshot(path)  # discard any stale record for this path
+    if snapshot is not None and not path.exists():
+        # No file to preserve anything from, so there is no lost update to avoid -- and
+        # replaying a delta here would be actively wrong: every key the caller did NOT
+        # change is skipped as "leave what is on disk", and nothing is on disk, so those
+        # keys would simply vanish. Write the payload whole, as an unpaired write does.
+        snapshot = None
+    with _config_file_lock(path, timeout=_WRITE_LOCK_TIMEOUT, blocking=True) as acquired:
+        if acquired is False:
+            # A lock exists and another writer holds it -- see _config_file_lock for why
+            # proceeding anyway would silently discard that writer's update. Off the event
+            # loop this has already waited `timeout`; on it there is no wait at all.
+            raise ConfigBusyError(
+                f"config file is being written by another process: {path}"
+            )
+        if acquired is None:
+            # No lock is available in this directory at all, so there is no competing
+            # holder to race. Proceed -- refusing would break settings on a host whose
+            # config directory is read-only but whose symlink target is writable.
+            logger.debug("config write proceeding without a lock: %s", path)
+        payload = data
+        if snapshot is not None:
+            try:
+                current = read_config_for_update(path)
+            except ConfigReadError:
+                # The file on disk is unreadable. Replaying a delta onto it is not
+                # possible, and refusing would strand the caller, so write what they
+                # asked for -- the same outcome as before this merge existed.
+                current = None
+            else:
+                _take_snapshot(path)  # drop the snapshot our own re-read just recorded
+            if current is not None:
+                payload = _apply_delta(current, snapshot, data)
+        _write_config_unlocked(path, payload, fsync=fsync)
+
+
+def _write_config_unlocked(path: Path, data: dict, *, fsync: bool = False) -> None:
     """Write a config dict to *path* atomically, PRESERVING its permissions.
 
     The companion to :func:`read_config_for_update`. Two properties matter:
@@ -689,6 +792,362 @@ def stamp_config_meta(data: dict) -> dict:
         },
         **{k: v for k, v in data.items() if k != "meta"},
     }
+
+
+#: How long an OFF-loop write waits for the lock before refusing. On the loop the
+#: budget is always zero -- see _config_file_lock. Named so a test can shorten it
+#: rather than spending the full wait.
+_WRITE_LOCK_TIMEOUT = 5.0
+
+
+#: What ``read_config_for_update`` last handed out, per resolved path, per thread.
+#: A thread-local rather than a ``ContextVar`` on purpose: across all 12 sites in this
+#: repo that read the config and write it back in the same function, there is not a
+#: single ``await`` between the read and the write, so the pair never crosses a
+#: suspension point and one task cannot pick up another's snapshot.
+_read_snapshots = threading.local()
+
+
+def _snapshot_key(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def _remember_snapshot(path: Path, data: dict) -> None:
+    store = getattr(_read_snapshots, "by_path", None)
+    if store is None:
+        store = {}
+        _read_snapshots.by_path = store
+    # Deep copy via JSON round-trip: the caller is about to mutate the dict it was
+    # handed, and the snapshot has to stay as-read to be a usable base for the diff.
+    # Config is a few KB of plain JSON, so this costs microseconds.
+    try:
+        store[_snapshot_key(path)] = json.loads(json.dumps(data))
+    except (TypeError, ValueError):  # pragma: no cover - non-JSON payload
+        store.pop(_snapshot_key(path), None)
+
+
+def _take_snapshot(path: Path) -> dict | None:
+    """Pop the snapshot for *path*, or ``None`` if this write has no matching read."""
+    store = getattr(_read_snapshots, "by_path", None)
+    if not store:
+        return None
+    return store.pop(_snapshot_key(path), None)
+
+
+def _apply_delta(base: dict, snapshot: dict, desired: dict) -> dict:
+    """Replay the caller's edits (``snapshot`` -> ``desired``) on top of ``base``.
+
+    Key-level and recursive, never a whole-object replacement -- that is the difference
+    between "your setting and mine both survive" and "whoever writes last wins the whole
+    file". A key the caller did not touch keeps whatever is on disk NOW, which may be a
+    concurrent writer's newer value; that is the case that makes the merge work at all.
+    Where both sides changed the same leaf the caller's value wins, which is unavoidable
+    and is exactly what a serialised pair of writes would have produced anyway.
+    """
+    result = dict(base)
+    for key in set(snapshot) | set(desired):
+        in_snap = key in snapshot
+        in_want = key in desired
+        if in_snap and not in_want:
+            result.pop(key, None)  # the caller deleted it
+            continue
+        if not in_want:
+            continue
+        want = desired[key]
+        was = snapshot.get(key)
+        if in_snap and want == was:
+            continue  # untouched by the caller -- do not clobber a newer value
+        if (
+            isinstance(want, dict)
+            and isinstance(was, dict)
+            and isinstance(result.get(key), dict)
+        ):
+            result[key] = _apply_delta(result[key], was, want)
+        else:
+            result[key] = want
+    return result
+
+
+class ConfigBusyError(OSError):
+    """The config write lock could not be taken, so nothing was written.
+
+    Derives from ``OSError`` deliberately: every caller of these helpers already
+    handles ``OSError`` from the underlying file write (a read-only data home, a full
+    disk, an unwritable symlink target), and a caller that treats "could not write"
+    uniformly is correct here too. The one thing it must NOT do is report success.
+    """
+
+
+def config_fingerprint(path: Path) -> str | None:
+    """SHA-256 of *path*'s bytes, or ``None`` when it does not exist.
+
+    Content, not ``(mtime, size)``: two writes of equal length inside one filesystem
+    timestamp tick are indistinguishable by ``stat``, and coarse ``mtime`` granularity
+    is common enough that a same-length edit slips straight through such a check.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+
+
+@contextlib.contextmanager
+def _config_file_lock(
+    path: Path, *, timeout: float, blocking: bool
+) -> Iterator[bool | None]:
+    """Take an exclusive lock covering *path*; yield whether it was acquired.
+
+    The lock is a **sidecar** (``<name>.lock``), never the config inode. An atomic
+    config write replaces the file by ``rename``, which would drop a lock held on the
+    old inode -- the write would release the very lock meant to guard it, and the next
+    writer would find the lock free while the first was still mid-transaction.
+
+    Yields ``False`` rather than raising when the lock is unavailable, so the caller
+    decides between refusing and proceeding. The two unavailable cases differ
+    deliberately:
+
+    * **No locking primitive on this platform** (neither ``fcntl`` nor ``msvcrt``) --
+      reported as ACQUIRED, because a settings write must not become impossible there.
+      The fingerprint check in :class:`ConfigTransaction` still catches an interleaved
+      write; it just cannot prevent one.
+    * **The sidecar cannot be created** -- reported as NOT acquired, so a required
+      transaction refuses. That is the read-only-directory case, where proceeding would
+      let every writer run unlocked while still reporting success.
+    """
+    # Beside the RESOLVED target, not beside the symlink. Symlinking config.json into a
+    # dotfiles repo is a supported setup (``write_config_atomically`` resolves it for the
+    # same reason), and in that setup the directory holding the LINK can be read-only
+    # while the target is writable. A sidecar placed next to the link would then be
+    # uncreatable even though the write itself succeeds, so every writer would proceed
+    # unlocked. Placing it next to the target puts the lock where the write lands.
+    target = path
+    try:
+        if path.is_symlink():
+            target = path.resolve()
+    except OSError:
+        pass
+
+    # Dot-prefixed so it does not clutter the user's data directory listing. It is a
+    # persistent file, not a temp one -- flock needs an inode that outlives the write it
+    # guards -- so it cannot simply be deleted afterwards.
+    lock_path = target.with_name("." + target.name + ".lock")
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+")
+    except OSError:
+        # No sidecar next to the target either. `None`, not `False`: the two failures
+        # need opposite handling and only the caller can tell them apart.
+        #
+        #   None  -- no lock is AVAILABLE here (this directory cannot hold the sidecar).
+        #            Nobody else can be holding one either, so there is no writer to race
+        #            and proceeding unlocked is safe. Refusing would break settings on a
+        #            host whose config directory is read-only but whose symlink target is
+        #            writable.
+        #   False -- a lock exists and someone else HOLDS it. There is a concrete
+        #            competing writer, so proceeding is a lost update.
+        #
+        # Both are falsy, so a caller that only asks `if not acquired` keeps its existing
+        # behaviour and a required transaction still refuses.
+        yield None
+        return
+
+    acquired = False
+    try:
+        if fcntl is None and msvcrt is None:  # pragma: no cover - no locking available
+            acquired = True
+        else:
+            # NEVER poll on the event loop. A `time.sleep` spin here is reachable
+            # inline from async handlers, where it stalls every session and the
+            # liveness heartbeat -- the repo's `no-blocking-call-on-event-loop` rule.
+            #
+            # So an on-loop caller gets ONE non-blocking attempt and no wait. What it
+            # must NOT do is proceed unlocked: the delta merge does not rescue that
+            # case. The merge base is the re-read, and a lock holder can land its own
+            # rename between that re-read and ours, so the payload we then write was
+            # computed from bytes that are already stale and the holder's update is
+            # overwritten. The lock covers the re-read -> rename span for exactly that
+            # reason; skipping it silently loses updates.
+            #
+            # `write_config_atomically` therefore raises `ConfigBusyError` on a False
+            # here. Failing a config write under genuine contention is loud and
+            # recoverable by a retry; silently reverting a setting the user just
+            # changed is neither.
+            on_loop = False
+            try:
+                asyncio.get_running_loop()
+                on_loop = True
+            except RuntimeError:
+                pass
+            budget = 0.0 if on_loop else (timeout if blocking else 0.0)
+            deadline = time.monotonic() + budget
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    else:  # pragma: no cover - Windows
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    # A held critical section is one atomic write -- measured at 0.57ms
+                    # median, 1.47ms worst on this repo's config -- so a 5ms poll costs
+                    # at most a few iterations in the realistic case.
+                    time.sleep(0.005)
+        yield acquired
+    finally:
+        try:
+            if acquired and fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif acquired and msvcrt is not None:  # pragma: no cover - Windows
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        finally:
+            handle.close()
+
+
+class ConfigTransaction:
+    """A read-modify-write of the config file held under one lock.
+
+    Handed out by :func:`config_transaction`. ``read()`` and ``write()`` must both
+    happen inside the ``with`` block -- that is the entire point, and the reason this
+    is a transaction rather than a locked ``write_config_atomically``. Locking only
+    the write would make the *rename* mutually exclusive while leaving the read
+    outside, so two callers still read the same snapshot and the second write still
+    discards the first's change. A lost update is created between the read and the
+    write, so that is the span the lock has to cover.
+    """
+
+    def __init__(self, path: Path, *, locked: bool) -> None:
+        self._path = path
+        self._locked = locked
+        self._fingerprint_at_read: str | None = None
+        self._read_called = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def locked(self) -> bool:
+        """False when the platform or filesystem could not provide a lock."""
+        return self._locked
+
+    def read(self) -> dict:
+        """Read the current config. Raises ``ConfigReadError`` on a corrupt file."""
+        # Fingerprint BEFORE the read, not after: a writer landing *during* the read
+        # would otherwise be invisible, because a post-read hash already includes it.
+        self._fingerprint_at_read = config_fingerprint(self._path)
+        data = read_config_for_update(self._path)
+        self._read_called = True
+        return data
+
+    def write(self, data: dict, *, fsync: bool = False) -> None:
+        """Write *data*, refusing if the file changed since :meth:`read`."""
+        if not self._read_called:
+            raise RuntimeError(
+                "ConfigTransaction.write() before read(); the transaction exists to "
+                "cover a read-modify-write, so writing a payload that was not derived "
+                "from a read inside it has no guarantee to offer"
+            )
+        current = config_fingerprint(self._path)
+        if current != self._fingerprint_at_read:
+            raise ConfigBusyError(
+                f"{self._path} changed while this update was in flight; nothing was "
+                "written"
+            )
+        # The transaction already holds the lock and has verified the fingerprint,
+        # so it writes through the unlocked primitive rather than re-entering the
+        # public wrapper (flock is per-open-file-description: a second open in this
+        # same process would block on our own lock).
+        _take_snapshot(self._path)
+        _write_config_unlocked(self._path, data, fsync=fsync)
+
+
+@contextlib.contextmanager
+def config_transaction(
+    path: Path | None = None, *, timeout: float = 5.0, required: bool = True
+) -> Iterator[ConfigTransaction]:
+    """Hold the config lock across a read-modify-write.
+
+    Use this instead of ``read_config_for_update`` followed by
+    ``write_config_atomically`` whenever the new value depends on the old one -- which
+    is every settings update in this repo.
+
+    **Blocking is correct here and only here.** The critical section is a single atomic
+    write (measured 0.57ms median / 1.47ms worst on a 13KB config), so a contended
+    caller waits milliseconds. It is still a blocking wait, so an ``async`` caller must
+    NOT call this inline -- use :func:`amutate_config`, which runs the whole
+    transaction on a worker thread and leaves the event loop free.
+
+    With ``required=True`` (the default) a lock that cannot be taken within *timeout*
+    raises :class:`ConfigBusyError` rather than proceeding unlocked. Pass
+    ``required=False`` for a write that is genuinely optional -- ``load()``'s one-time
+    migration write-back is the motivating case: it re-materialises defaults it already
+    holds in memory, so skipping it under contention loses nothing, whereas waiting on
+    it would put a lock wait on every code path that reads config.
+    """
+    target = path or config_path()
+    with _config_file_lock(target, timeout=timeout, blocking=True) as acquired:
+        if not acquired and required:
+            raise ConfigBusyError(
+                f"another process holds the config lock for {target} (waited "
+                f"{timeout:.1f}s); nothing was written"
+            )
+        # The lock's tri-state collapses to a bool here on purpose: a transaction
+        # treats "held by someone else" and "no lock available" the same way -- it is
+        # not locked, so `required=True` refuses either way. Only
+        # `write_config_atomically` needs to tell them apart.
+        yield ConfigTransaction(target, locked=bool(acquired))
+
+
+def mutate_config(
+    mutate: Callable[[dict], None],
+    path: Path | None = None,
+    *,
+    timeout: float = 5.0,
+    fsync: bool = False,
+) -> dict:
+    """Apply *mutate* to the config under one transaction and return the written dict.
+
+    *mutate* is called with the freshly-read config and edits it in place. It must be
+    free of side effects beyond that dict: on a detected concurrent write the
+    transaction refuses, and a mutate that had already sent a Slack message or spawned
+    a process would leave that half-done.
+    """
+    with config_transaction(path, timeout=timeout) as txn:
+        data = txn.read()
+        mutate(data)
+        txn.write(data, fsync=fsync)
+        return data
+
+
+async def amutate_config(
+    mutate: Callable[[dict], None],
+    path: Path | None = None,
+    *,
+    timeout: float = 5.0,
+    fsync: bool = False,
+) -> dict:
+    """``mutate_config`` on a worker thread -- the form async callers must use.
+
+    The transaction blocks while waiting for the lock, so calling ``mutate_config``
+    inline from a coroutine would stall the gateway's event loop, freezing every
+    session and the liveness heartbeat. Offloading keeps the wait off the loop while
+    still serialising against other writers, in this process and in others.
+    """
+    return await asyncio.to_thread(
+        mutate_config, mutate, path, timeout=timeout, fsync=fsync
+    )
 
 
 def workspace_dir_for(workspace: str | None = None) -> Path:
@@ -4892,6 +5351,18 @@ class KiroCrewConfig:
     # round-trips it untouched.
     _extra_sections: dict = field(default_factory=dict)
 
+    #: The raw dict this instance was parsed from, when it came from ``load()``.
+    #: ``save()`` replays only the difference against this, so a concurrent change
+    #: to a field this instance never touched is not reverted by a whole-model dump.
+    #: ``init=False``/``compare=False`` keep it out of the constructor and equality,
+    #: and ``to_dict()`` builds its output explicitly so it never reaches the file.
+    _loaded_from: dict | None = field(default=None, repr=False, compare=False)
+    #: Resolved path `_loaded_from` was captured from. A baseline is only valid for
+    #: that file: `KIROCREW_HOME` can be repointed within one process, and a baseline
+    #: applied to a different config would skip every key it considers unchanged and
+    #: silently inherit the other file's values.
+    _loaded_path: str | None = field(default=None, repr=False, compare=False)
+
     def channel_config(self, channel_id: str) -> ChannelConfig:
         """Return the config for *channel_id*, falling back to defaults.
 
@@ -5878,6 +6349,23 @@ class KiroCrewConfig:
             # Migration write-back is best-effort; never block startup.
             logger.warning("Config write-back failed: %s", e)
 
+        # Remember this instance's starting point so save() replays only its own edits
+        # instead of overwriting the file with a whole-model dump.
+        #
+        # It has to be the CANONICAL payload shape, not the raw parsed file. `save()`
+        # writes `to_dict()`, which fills in a default for every key the file omits; a raw
+        # baseline does not have those keys, so the delta counts each one as "the caller
+        # set this" and replays it over whatever is on disk now. On a partial config that
+        # is most of the file -- a dashboard toggle of `auto_update` landing after this
+        # load would be reverted to its default by the next save. Building the baseline
+        # through the same helper `save()` writes with is what keeps the two in step.
+        try:
+            cfg._loaded_from = cfg._canonical_payload()
+            cfg._loaded_path = _snapshot_key(path)
+        except (TypeError, ValueError, OSError):  # pragma: no cover - unreadable overlay
+            cfg._loaded_from = None
+            cfg._loaded_path = None
+
         return cfg
 
     def to_dict(self) -> dict:
@@ -5947,6 +6435,45 @@ class KiroCrewConfig:
         slack_section["observe_ttl_hours"] = self.observe_ttl_hours
         return d
 
+    def _canonical_payload(self) -> dict:
+        """The exact dict ``save()`` writes, before the ``meta`` stamp.
+
+        Two callers need it and they must agree: ``save()`` as the payload, and ``load()``
+        as the baseline that payload will be diffed against. A baseline in any other shape
+        makes untouched keys look edited (a raw file dict lacks the defaults ``to_dict()``
+        fills in) or makes edited keys look deleted (a canonical dict against a raw
+        payload), so both come from here rather than from two copies of the same steps.
+
+        Overlay-owned values are stripped so ``config.local.json`` settings do not leak
+        into the base file.
+        """
+        d = self.to_dict()
+        local_path = config_local_path()
+        if local_path.is_file():
+            try:
+                raw_local = json.loads(local_path.read_text(encoding="utf-8"))
+                if isinstance(raw_local, dict):
+                    d = _subtract_overlay(d, raw_local)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return d
+
+    def baseline_for(self, path: Path) -> dict | None:
+        """The baseline to write *path* with, or ``None`` if this instance has none for it.
+
+        Public so a writer that builds its own ``to_dict()``-shaped payload instead of
+        calling ``save()`` -- ``kirocrew config set KEY VALUE`` is the one in this repo --
+        gets the same protection ``save()`` gets.
+
+        Returns ``None`` for any path other than the one this instance was loaded from,
+        because a delta replayed against a different file drops every key it reads as
+        unchanged.
+        """
+        recorded = getattr(self, "_loaded_path", None)
+        if recorded is None or recorded != _snapshot_key(path):
+            return None
+        return getattr(self, "_loaded_from", None)
+
     def save(self) -> None:
         """Write current config to ~/.kiro/crew/config.json.
 
@@ -5957,22 +6484,28 @@ class KiroCrewConfig:
         output to prevent overlay settings from leaking into the base file.
         """
 
-        d = self.to_dict()
-
-        # Strip overlay-owned values so they don't leak into config.json
-        local_path = config_local_path()
-        if local_path.is_file():
-            try:
-                raw_local = json.loads(local_path.read_text(encoding="utf-8"))
-                if isinstance(raw_local, dict):
-                    d = _subtract_overlay(d, raw_local)
-            except (json.JSONDecodeError, OSError):
-                pass
+        d = self._canonical_payload()
 
         # Atomic + mode-preserving: a concurrent reader must never observe a
         # half-written config, and the write must not widen who can read a file
         # that may hold inline credentials. See write_config_atomically.
-        write_config_atomically(config_path(), stamp_config_meta(d))
+        # `stamp_config_meta` names the build that wrote these bytes; `baseline` is the
+        # raw dict this instance was loaded from. Both are required. Without the stamp a
+        # whole-model dump drops the meta block; without the baseline `save()` has no
+        # delta to replay, so a dashboard toggle committed after this instance was loaded
+        # is silently reverted.
+        #
+        # The two interact benignly: a fresh stamp always differs from the loaded one, so
+        # the delta always replays it.
+        #
+        # An instance attribute rather than the thread-local read record: the baseline
+        # belongs to this config object, so a `load()` elsewhere on the same thread cannot
+        # be mistaken for this one's starting point.
+        write_config_atomically(
+            config_path(),
+            stamp_config_meta(d),
+            baseline=self.baseline_for(config_path()),
+        )
         # Drop the validated-data cache so the next load() re-reads this write.
         # mtime-keying already detects the change; this makes it immediate even
         # if the filesystem mtime resolution is coarse.

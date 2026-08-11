@@ -185,7 +185,14 @@ def _config_cmd(args: argparse.Namespace) -> None:
                             d = _subtract_overlay(d, raw_local)
                     except (json.JSONDecodeError, OSError):
                         pass
-                write_config_atomically(config_path(), stamp_config_meta(d))
+                # `baseline` for the same reason `save()` passes one: `d` is a whole-model
+                # dump, so without it the write replays every defaulted key over whatever
+                # is on disk now and reverts a setting changed since this load.
+                write_config_atomically(
+                    config_path(),
+                    stamp_config_meta(d),
+                    baseline=cfg.baseline_for(config_path()),
+                )
                 sel().log_api_access(
                     caller="cli",
                     operation="config_set",
