@@ -94,6 +94,7 @@ import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
 import PendingQuestionCard from '../components/PendingQuestionCard'
+import SessionPulseSurveyCard from '../components/SessionPulseSurveyCard'
 import type { FollowupItem } from '../store/chatSlice'
 
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
@@ -779,6 +780,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const messages = useAppSelector(s => s.chat.messages)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+  const kiroCrewVersion = useAppSelector(s => s.dashboard.status?.version) || ''
+  const { data: authMe } = useQuery({
+    queryKey: ['auth-me'],
+    queryFn: async () => {
+      const resp = await fetch('/api/auth/me', { credentials: 'include' })
+      if (!resp.ok) return null
+      return resp.json() as Promise<{ user_id: string }>
+    },
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  })
+  const assistantTurnCount = useMemo(
+    () =>
+      messages.filter(
+        m =>
+          m.role === 'assistant' &&
+          (m.kind ?? (m.meta?.kind as string | undefined)) !== 'compaction',
+      ).length,
+    [messages],
+  )
   const knowledgeFetch = useKnowledgeFetch(activeSlot)
   const knowledgeFetchRef = useRef(knowledgeFetch)
   knowledgeFetchRef.current = knowledgeFetch
@@ -2921,6 +2942,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     })
     return () => cancelAnimationFrame(raf)
   }, [activeTip, scrollBottom])
+
+  // Same re-anchor need as the tip above, for the session pulse survey card:
+  // it renders after ChatFooter, outside the virtualizer's measured rows, so
+  // mounting/unmounting it changes the scroll viewport's real content height
+  // without the virtualizer knowing — otherwise a new turn arriving while the
+  // card is showing renders visually behind/under it instead of pushing it
+  // out of view.
+  const [surveyVisible, setSurveyVisible] = useState(false)
+  useEffect(() => {
+    if (!isAtBottomRef.current) return
+    const raf = requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (isAtBottomRef.current) scrollBottom(true)
+      })
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [surveyVisible, scrollBottom])
 
   // Navigate to a (possibly off-window) display index: mount it first via the
   // virtualizer so the DOM-based scroll can find it, then scroll next frame.
@@ -6394,6 +6432,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
               {/* Footer */}
               <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
+              {activeSlot && (
+                <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+                  <SessionPulseSurveyCard
+                    // Remount on session switch: without this, React reuses
+                    // the same component instance across sessions, so an
+                    // in-progress rating/feedback/email from session A would
+                    // still be sitting in state when the user switches to
+                    // session B and hits Submit — attributing A's answers to
+                    // B's sessionId prop, which had already updated.
+                    key={activeSlot}
+                    sessionId={activeSlot}
+                    userId={authMe?.user_id || ''}
+                    kiroCrewVersion={kiroCrewVersion}
+                    turnCount={assistantTurnCount}
+                    onVisibleChange={setSurveyVisible}
+                  />
+                </div>
+              )}
               <div style={{height: '2vh'}} />
             </div>
             )}
