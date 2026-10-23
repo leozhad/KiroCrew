@@ -53,7 +53,10 @@ Kiro Crew maps these names to bundled Lucide symbols and keeps the stock
 cross-fading carousel; packs cannot inject loader code or SVG through this field.
 To ship your own loader art instead, put 1–8 `.png`/`.webp`/`.gif`/`.svg` files
 in `loader/` (Level 1): one renders alone, 2–8 are cycled, and they win over
-`loaderIcons`. With neither, the default Kiro ghost poses remain.
+`loaderIcons`. With neither, the default Kiro ghost poses remain. Animated art
+(WebP/APNG/GIF, or SVG with its own animation) plays as authored, except under
+reduced motion: there Kiro Crew shows each image's first frame, held still, so
+make the first frame read as the loader at rest.
 
 ## Fonts — the role system (the ONLY supported route)
 
@@ -99,6 +102,10 @@ REJECTED (install fails), so do not invent variables; the allowlist is
   vars are allowlisted too. The other fourteen terminal colors are derived from
   `--bg` / `--text` / `--danger` / `--ok` / `--warn` / `--info`, so a pack that
   wants its own terminal palette sets only those two.
+- The Settings section icon tiles follow your palette: each tile fills with
+  `--muted`, `--info`, `--ok`, `--accent`, `--warn`, `--aim` or `--danger`, and
+  its glyph uses the matching `-fg` ink. There is no tile variable to set; tune
+  those roles (and their `-fg` inks) if the tiles do not read well.
 
 ### Omitted tokens are derived from your palette
 

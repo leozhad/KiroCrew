@@ -113,13 +113,31 @@ The three hue modifiers also mix the same hue, at the same share, into
 `--glass-band-plain` (the polarity's plain band) and set `--glass-band`, so the
 lit top and bottom edges of a tinted pane are lit in its hue; a white band on
 an accent pane read as a white frame in light mode and a grey edge in dark.
-And
-the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
-the glass must read as a lit pane on any light palette and as smoked glass on any
-dark one, and a section's tile is an identity mark that must look the same in
-every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
-of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
-work; adding a color a pack should be able to change takes the role path below.
+They are fixed on purpose — the glass must read as a lit pane on any light
+palette and as smoked glass on any dark one — the same reasoning as the neutral
+`glass-shadow` rest shadow. Adding one of these takes a `:root` line plus a
+`[data-mode="light"]` line and no allowlist work; adding a color a pack should be
+able to change takes the role path below.
+
+**Settings icon tiles follow a custom theme.** The `--tile-*` set behind the
+Settings section icons (`src/styles/liquid-glass.css`) is not on the allowlist,
+and in a built-in theme it is the fixed system hues with one white glyph ink. In
+a custom theme (`[data-theme^="custom-"]`: an installed pack or an editor theme)
+each hue reads a palette role instead, and its glyph reads that role's own `-fg`
+ink, so a pack recolours the rail through the roles it already sets:
+
+| Tile hue | Fill | Glyph |
+|---|---|---|
+| gray | `--muted` | `--muted-fg` |
+| blue, teal | `--info` | `--info-fg` |
+| green | `--ok` | `--ok-fg` |
+| indigo | `--accent` | `--accent-fg` |
+| orange | `--warn` | `--warn-fg` |
+| pink, purple | `--aim` | `--aim-fg` |
+| red | `--danger` | `--danger-fg` |
+
+`src/test/SidePanelLayout.iconTile.test.tsx` pins that every hue the Settings
+tabs use maps onto an allowlisted role and that role's own ink.
 
 ## Adding a new color role
 
@@ -232,6 +250,14 @@ is the opposite by design: it is branding laid OVER the header strip and stays
 above it. The `body::before` / `body::after` idiom in `overrides.css` is not
 covered by this rule: it paints at the document root and therefore over the
 whole shell, header included.
+
+**L2 overlay triggers.** An overlay's `trigger` is `continuous`, `activate`, or
+`idle-<N>s`. An `idle-<N>s` overlay mounts after N seconds without input and
+unmounts on the next one. Input is a key press, a pointer press, or a wheel or
+touch scroll anywhere in the dashboard: inside a scroll container, and in the
+built-in terminal, which stops propagation of the events it consumes, so
+`ThemeExperienceLayer` listens in the capture phase. Under
+`prefers-reduced-motion: reduce` no overlay mounts at all.
 
 ## Brand identity
 
@@ -492,7 +518,11 @@ code:
 - **`loader/*.png` `.webp` `.gif` `.svg`** — ship your **own images** (Level 1).
   Ship **one** and it renders on its own; ship **2–8** and the stock carousel
   cycles them. Animated WebP/APNG/GIF and animated SVG **self-animate** inside
-  the `<img>`, so a single fully-authored loop is a first-class loader. Ordered
+  the `<img>`, so a single fully-authored loop is a first-class loader. Under
+  `prefers-reduced-motion: reduce` each image is painted once, at its first
+  frame, onto a `<canvas>` instead (`src/pages/chat/PackLoaderImage.tsx`),
+  because the page cannot pause an image's own animation; make that first
+  frame read as the loader at rest. Ordered
   by filename; each is served with a strict Content-Type + `nosniff` under the
   sandboxed asset CSP (`default-src 'none'; sandbox`), referenced only as an
   `<img>`. SVG is safe here for the same reason `logo.svg` is: an `<img>`-loaded
